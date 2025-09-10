@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  kafkaesque:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kafkaesque/app:dev
+    environment:
+      SECRET_KEY_BASE: "HpKHz3o9eLNKHz3o9eLNyWD6pjo7pFdbRMFdbRMFKHz3o9eLNyWD6pjo7HuIoXF9cg8HpKHz3o9eLNyWD6pjo7HuIoXF9cg8"
+      PORT: "4000"
+      API_PORT: "4001"
+      GRPC_PORT: "50051"
+      DATA_DIR: "/var/lib/kafkaesque/data"
+      OFFSETS_DIR: "/var/lib/kafkaesque/offsets"
+      RETENTION_HOURS: "168"
+      LOG_LEVEL: "info"
+    ports:
+      - "4000:4000"
+      - "4001:4001"
+      - "50051:50051"
+    volumes:
+      - kafkaesque-data:/var/lib/kafkaesque/data
+      - kafkaesque-offsets:/var/lib/kafkaesque/offsets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  kafkaesque-data:
+    driver: local
+  kafkaesque-offsets:
+    driver: local
