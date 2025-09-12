@@ -36,6 +36,7 @@ defmodule KafkaesqueCore.MixProject do
       {:telemetry, "~> 1.2"},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},
+      {:phoenix_pubsub, "~> 2.1"},
       {:jason, "~> 1.4"},
       {:nimble_options, "~> 1.1"},
       {:typed_struct, "~> 0.3"},

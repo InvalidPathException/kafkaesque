@@ -1,0 +1,29 @@
+{
+  "name": "kafkaesque-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node build.js --deploy",
+    "watch": "node build.js --watch",
+    "deploy": "cd .. && mix assets.deploy && rm -f _build/esbuild*"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.16",
+    "esbuild": "^0.19.12",
+    "esbuild-plugin-import-glob": "^0.1.1",
+    "esbuild-svelte": "^0.8.1",
+    "postcss": "^8.4.31",
+    "svelte": "^4.2.19",
+    "svelte-preprocess": "^5.1.4",
+    "tailwindcss": "^3.3.5"
+  },
+  "dependencies": {
+    "@tailwindcss/forms": "^0.5.10",
+    "chart.js": "^4.5.0",
+    "chartjs-adapter-date-fns": "^3.0.0",
+    "date-fns": "^4.1.0",
+    "phoenix": "^1.7.14",
+    "phoenix_html": "^4.1.0",
+    "phoenix_live_view": "^1.0.0"
+  }
+}

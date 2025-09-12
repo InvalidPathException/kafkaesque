@@ -7,7 +7,7 @@ config :kafkaesque_dashboard, KafkaesqueDashboard.Endpoint,
     formats: [html: KafkaesqueDashboard.ErrorHTML, json: KafkaesqueDashboard.ErrorJSON],
     layout: false
   ],
-  pubsub_server: KafkaesqueDashboard.PubSub,
+  pubsub_server: Kafkaesque.PubSub,
   live_view: [signing_salt: "sRqyXF9z"]
 
 # Configure server endpoint
@@ -37,6 +37,10 @@ config :kafkaesque_core, :telemetry,
 
 # Phoenix configuration
 config :phoenix, :json_library, Jason
+
+# LiveSvelte configuration
+config :live_svelte,
+  ssr: false
 
 # Logger configuration
 config :logger, :console,

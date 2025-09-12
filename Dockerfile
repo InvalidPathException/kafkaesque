@@ -1,3 +1,20 @@
+# ---- Asset build stage ----
+FROM node:20-slim AS assets
+
+WORKDIR /app
+
+# Copy package files
+COPY apps/kafkaesque_dashboard/assets/package*.json ./
+
+# Install npm dependencies
+RUN npm ci --production=false
+
+# Copy asset sources
+COPY apps/kafkaesque_dashboard/assets ./
+
+# Build assets for production
+RUN npm run build
+
 # ---- Build image ----
 FROM elixir:1.18-slim AS build
 
@@ -33,8 +50,14 @@ COPY apps/kafkaesque_server apps/kafkaesque_server
 COPY apps/kafkaesque_dashboard apps/kafkaesque_dashboard
 COPY proto proto
 
+# Copy built assets from assets stage
+COPY --from=assets /app/../priv/static/assets apps/kafkaesque_dashboard/priv/static/assets
+
 # Compile the application
 RUN mix compile
+
+# Digest static files
+RUN mix phx.digest
 
 # Build the release
 RUN mix release kafkaesque

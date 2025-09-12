@@ -8,7 +8,6 @@ defmodule KafkaesqueDashboard.Router do
     plug :put_root_layout, html: {KafkaesqueDashboard.Layouts, :root}
     plug :protect_from_forgery
     plug :put_secure_browser_headers
-    plug :put_layout, html: {KafkaesqueDashboard.Layouts, :app}
   end
 
   pipeline :api do
@@ -17,11 +16,7 @@ defmodule KafkaesqueDashboard.Router do
 
   scope "/", KafkaesqueDashboard do
     pipe_through :browser
-
-    live "/", OverviewLive, :index
-    live "/topics", TopicLive, :index
-    live "/topics/:topic", TopicLive, :show
-    live "/consumer-groups", ConsumerGroupLive, :index
+    live "/", DashboardLive, :index
   end
 
   # LiveDashboard

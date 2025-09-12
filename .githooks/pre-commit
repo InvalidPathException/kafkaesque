@@ -1,0 +1,31 @@
+#!/bin/bash
+echo "Running pre-commit checks..."
+
+if ! command -v mix &> /dev/null; then
+    echo "mix command not found. Please ensure Elixir is installed."
+    exit 1
+fi
+
+echo "Checking code formatting..."
+if ! mix format --check-formatted; then
+    echo "Code formatting issues detected!"
+    echo "Run 'mix format' to fix formatting issues"
+    exit 1
+fi
+
+echo "Running Credo analysis..."
+if ! mix credo --strict; then
+    echo "Credo found issues!"
+    echo "Run 'mix credo --strict' to see the issues"
+    exit 1
+fi
+
+echo "Compiling with warnings as errors..."
+if ! mix compile --warnings-as-errors; then
+    echo "Compilation warnings detected!"
+    echo "Fix the warnings before committing"
+    exit 1
+fi
+
+echo "All pre-commit checks passed!"
+exit 0

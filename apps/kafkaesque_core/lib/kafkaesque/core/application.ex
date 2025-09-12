@@ -8,6 +8,7 @@ defmodule Kafkaesque.Core.Application do
     children = [
       {Registry, keys: :unique, name: Kafkaesque.TopicRegistry},
       {DynamicSupervisor, name: Kafkaesque.TopicSupervisor, strategy: :one_for_one},
+      {Phoenix.PubSub, name: Kafkaesque.PubSub},
       Kafkaesque.Telemetry.Supervisor
     ]
 

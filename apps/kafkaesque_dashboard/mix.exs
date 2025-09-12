@@ -31,23 +31,31 @@ defmodule KafkaesqueDashboard.MixProject do
     [
       {:kafkaesque_core, in_umbrella: true},
       {:phoenix, "~> 1.7"},
-      {:phoenix_html, "~> 4.0"},
-      {:phoenix_live_view, "~> 0.20.17"},
+      {:phoenix_html, "~> 4.1"},
+      {:phoenix_live_view, "~> 1.0"},
       {:phoenix_live_dashboard, "~> 0.8"},
       {:phoenix_pubsub, "~> 2.1"},
-      {:phoenix_live_reload, "~> 1.4", only: :dev},
+      {:phoenix_live_reload, "~> 1.5", only: :dev},
+      {:live_svelte, "~> 0.16.0"},
       {:telemetry_metrics, "~> 1.0"},
-      {:telemetry_poller, "~> 1.0"},
+      {:telemetry_poller, "~> 1.1"},
       {:jason, "~> 1.4"},
-      {:plug_cowboy, "~> 2.6"},
+      {:plug_cowboy, "~> 2.7"},
       {:heroicons, "~> 0.5"},
-      {:floki, ">= 0.35.0", only: :test}
+      {:floki, ">= 0.36.0", only: :test}
     ]
   end
 
   defp aliases do
     [
-      test: ["test"]
+      setup: ["deps.get", "assets.setup", "assets.build"],
+      test: ["test"],
+      "assets.setup": ["cmd --cd assets npm ci"],
+      "assets.build": ["cmd --cd assets npm run build"],
+      "assets.deploy": [
+        "cmd --cd assets npm run build",
+        "phx.digest"
+      ]
     ]
   end
 end

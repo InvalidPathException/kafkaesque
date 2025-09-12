@@ -3,12 +3,15 @@ defmodule KafkaesqueDashboard.Application do
 
   use Application
 
+  alias KafkaesqueDashboard.{Endpoint, Telemetry}
+  alias LiveSvelte.SSR
+
   @impl true
   def start(_type, _args) do
     children = [
-      KafkaesqueDashboard.Telemetry,
-      {Phoenix.PubSub, name: KafkaesqueDashboard.PubSub},
-      KafkaesqueDashboard.Endpoint
+      {NodeJS.Supervisor, [path: SSR.NodeJS.server_path(), pool_size: 4]},
+      Telemetry,
+      Endpoint
     ]
 
     opts = [strategy: :one_for_one, name: KafkaesqueDashboard.Supervisor]
@@ -17,7 +20,7 @@ defmodule KafkaesqueDashboard.Application do
 
   @impl true
   def config_change(changed, _new, removed) do
-    KafkaesqueDashboard.Endpoint.config_change(changed, removed)
+    Endpoint.config_change(changed, removed)
     :ok
   end
 end

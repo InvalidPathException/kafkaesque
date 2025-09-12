@@ -12,9 +12,9 @@ defmodule KafkaesqueDashboard.Endpoint do
 
   plug Plug.Static,
     at: "/",
-    from: :kafkaesque_dashboard,
+    from: {:kafkaesque_dashboard, "priv/static"},
     gzip: false,
-    only: KafkaesqueDashboard.static_paths()
+    only: ~w(assets fonts images favicon.ico robots.txt demo.html js css)
 
   if code_reloading? do
     socket "/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket

@@ -7,6 +7,7 @@ defmodule Kafkaesque.MixProject do
       version: "0.1.0",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      listeners: [Phoenix.CodeReloader],
       releases: [
         kafkaesque: [
           applications: [
@@ -30,12 +31,25 @@ defmodule Kafkaesque.MixProject do
 
   defp aliases do
     [
-      setup: ["deps.get", "deps.compile"],
+      setup: ["deps.get", "deps.compile", "assets.setup"],
       test: ["test --no-start"],
       "format.check": ["format --check-formatted"],
       lint: ["compile --warnings-as-errors", "format.check", "credo --strict"],
       "proto.gen": [
         "cmd protoc --elixir_out=plugins=grpc:./apps/kafkaesque_server/lib/grpc --proto_path=./proto ./proto/kafkaesque.proto"
+      ],
+      "assets.setup": [
+        "cmd --cd apps/kafkaesque_dashboard/assets npm install"
+      ],
+      "assets.build": [
+        "cmd --cd apps/kafkaesque_dashboard/assets npm run build",
+        "phx.digest"
+      ],
+      "assets.deploy": [
+        "assets.build"
+      ],
+      "assets.watch": [
+        "cmd --cd apps/kafkaesque_dashboard/assets npm run watch"
       ]
     ]
   end
