@@ -13,16 +13,9 @@ defmodule Kafkaesque.Topic.SupervisorTest do
     Application.put_env(:kafkaesque_core, :data_dir, test_dir)
     Application.put_env(:kafkaesque_core, :offsets_dir, Path.join(test_dir, "offsets"))
 
-    # Start the topic supervisor if not already started
-    case Process.whereis(TopicSupervisor) do
-      nil ->
-        case TopicSupervisor.start_link([]) do
-          {:ok, pid} -> {:ok, pid}
-          {:error, {:already_started, pid}} -> {:ok, pid}
-        end
-      pid ->
-        {:ok, pid}
-    end
+    # The supervisor should already be started by the application
+    # Just verify it's running (registered as the module name)
+    assert Process.whereis(Kafkaesque.Topic.Supervisor) != nil
 
     on_exit(fn ->
       # Clean up any created topics

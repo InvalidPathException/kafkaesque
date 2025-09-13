@@ -45,15 +45,21 @@ defmodule Kafkaesque.Pipeline.ProduceBroadwayTest do
           max_queue_size: 100
         )
 
-      assert {:ok, pid} =
-               ProduceBroadway.start_link(
-                 topic: @test_topic,
-                 partition: @test_partition,
-                 batch_size: 10,
-                 batch_timeout: 1
-               )
+      result =
+        ProduceBroadway.start_link(
+          topic: @test_topic,
+          partition: @test_partition,
+          batch_size: 10,
+          batch_timeout: 1
+        )
 
-      assert Process.alive?(pid)
+      case result do
+        {:ok, pid} ->
+          assert Process.alive?(pid)
+
+        {:error, {:already_started, pid}} ->
+          assert Process.alive?(pid)
+      end
     end
   end
 

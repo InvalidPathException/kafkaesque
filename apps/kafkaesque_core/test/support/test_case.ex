@@ -18,59 +18,9 @@ defmodule Kafkaesque.TestCase do
   end
 
   setup do
-    # Start required registries and services
-    ensure_registry_started()
-    # Only start PubSub if the application isn't already managing it
-    unless Application.started_applications() |> Enum.any?(fn {app, _, _} -> app == :kafkaesque_core end) do
-      ensure_pubsub_started()
-    end
-    ensure_telemetry_started()
-
+    # The application is started in test_helper.exs, so we don't need to start services here
+    # They should already be running
     :ok
-  end
-
-  @doc """
-  Ensures the Registry is started.
-  """
-  def ensure_registry_started do
-    case Registry.start_link(keys: :unique, name: Kafkaesque.TopicRegistry) do
-      {:ok, _} -> :ok
-      {:error, {:already_started, _}} -> :ok
-    end
-  end
-
-  @doc """
-  Ensures PubSub is started.
-  """
-  def ensure_pubsub_started do
-    # Check if PubSub is already running
-    case Process.whereis(Kafkaesque.PubSub) do
-      nil ->
-        # Not running, start it
-        children = [
-          {Phoenix.PubSub, name: Kafkaesque.PubSub}
-        ]
-
-        case Supervisor.start_link(children, strategy: :one_for_one, name: KafkaesqueTestPubSub) do
-          {:ok, _} -> :ok
-          {:error, {:already_started, _}} -> :ok
-          {:error, {:shutdown, {:failed_to_start_child, Phoenix.PubSub, {:already_started, _}}}} -> :ok
-        end
-
-      _pid ->
-        # Already running
-        :ok
-    end
-  end
-
-  @doc """
-  Ensures Telemetry is started.
-  """
-  def ensure_telemetry_started do
-    case Kafkaesque.Telemetry.start_link([]) do
-      {:ok, _} -> :ok
-      {:error, {:already_started, _}} -> :ok
-    end
   end
 
   @doc """
