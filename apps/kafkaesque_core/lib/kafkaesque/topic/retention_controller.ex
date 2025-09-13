@@ -29,8 +29,6 @@ defmodule Kafkaesque.Topic.RetentionController do
     ]
   end
 
-  # Client API
-
   @doc """
   Starts the retention controller for a topic-partition.
   """
@@ -70,8 +68,6 @@ defmodule Kafkaesque.Topic.RetentionController do
   def get_stats(topic, partition) do
     GenServer.call(via_tuple(topic, partition), :get_stats)
   end
-
-  # Server callbacks
 
   @impl true
   def init(opts) do
@@ -154,10 +150,8 @@ defmodule Kafkaesque.Topic.RetentionController do
     {:noreply, new_state}
   end
 
-  # Private functions
-
   defp via_tuple(topic, partition) do
-    {:via, Registry, {Kafkaesque.TopicRegistry, {topic, partition, :retention_controller}}}
+    {:via, Registry, {Kafkaesque.TopicRegistry, {:retention_controller, topic, partition}}}
   end
 
   defp schedule_retention_check do

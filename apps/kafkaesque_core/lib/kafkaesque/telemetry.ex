@@ -34,8 +34,6 @@ defmodule Kafkaesque.Telemetry do
     ]
   end
 
-  # Client API
-
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
@@ -247,8 +245,6 @@ defmodule Kafkaesque.Telemetry do
     GenServer.call(__MODULE__, :get_metrics)
   end
 
-  # Server callbacks
-
   @impl true
   def init(_opts) do
     # Create ETS table for storing raw metrics
@@ -297,8 +293,6 @@ defmodule Kafkaesque.Telemetry do
     {:noreply, %{state | aggregated_metrics: metrics}}
   end
 
-  # Private functions
-
   defp attach_handlers do
     handlers = [
       {@message_produced, &handle_message_produced/4},
@@ -327,26 +321,30 @@ defmodule Kafkaesque.Telemetry do
 
   defp handle_message_produced(_event, measurements, metadata, _config) do
     # Store in ETS for aggregation
-    key = {:messages_produced, metadata[:topic], metadata[:partition]}
-    timestamp = measurements[:timestamp]
+    if :ets.whereis(:telemetry_metrics) != :undefined do
+      key = {:messages_produced, metadata[:topic], metadata[:partition]}
+      timestamp = measurements[:timestamp]
 
-    :ets.insert(:telemetry_metrics, {
-      {key, timestamp},
-      measurements[:count],
-      measurements[:bytes]
-    })
+      :ets.insert(:telemetry_metrics, {
+        {key, timestamp},
+        measurements[:count],
+        measurements[:bytes]
+      })
+    end
   end
 
   defp handle_message_consumed(_event, measurements, metadata, _config) do
-    key = {:messages_consumed, metadata[:topic], metadata[:partition]}
-    timestamp = measurements[:timestamp]
+    if :ets.whereis(:telemetry_metrics) != :undefined do
+      key = {:messages_consumed, metadata[:topic], metadata[:partition]}
+      timestamp = measurements[:timestamp]
 
-    :ets.insert(:telemetry_metrics, {
-      {key, timestamp},
-      measurements[:count],
-      measurements[:bytes],
-      measurements[:latency_ms]
-    })
+      :ets.insert(:telemetry_metrics, {
+        {key, timestamp},
+        measurements[:count],
+        measurements[:bytes],
+        measurements[:latency_ms]
+      })
+    end
   end
 
   defp handle_topic_created(_event, measurements, metadata, _config) do
@@ -376,45 +374,55 @@ defmodule Kafkaesque.Telemetry do
   end
 
   defp handle_offset_committed(_event, measurements, metadata, _config) do
-    key = {:offset_committed, metadata[:group_id], metadata[:topic], metadata[:partition]}
-    timestamp = measurements[:timestamp]
+    if :ets.whereis(:telemetry_metrics) != :undefined do
+      key = {:offset_committed, metadata[:group_id], metadata[:topic], metadata[:partition]}
+      timestamp = measurements[:timestamp]
 
-    :ets.insert(:telemetry_metrics, {
-      {key, timestamp},
-      measurements[:offset]
-    })
+      :ets.insert(:telemetry_metrics, {
+        {key, timestamp},
+        measurements[:offset]
+      })
+    end
   end
 
   defp handle_lag_measured(_event, measurements, metadata, _config) do
-    key = {:lag, metadata[:group_id], metadata[:topic], metadata[:partition]}
-    timestamp = measurements[:timestamp]
+    if :ets.whereis(:telemetry_metrics) != :undefined do
+      key = {:lag, metadata[:group_id], metadata[:topic], metadata[:partition]}
+      timestamp = measurements[:timestamp]
 
-    :ets.insert(:telemetry_metrics, {
-      {key, timestamp},
-      measurements[:lag]
-    })
+      :ets.insert(:telemetry_metrics, {
+        {key, timestamp},
+        measurements[:lag]
+      })
+    end
   end
 
   defp handle_storage_write(_event, measurements, metadata, _config) do
-    key = {:storage_write, metadata[:topic], metadata[:partition]}
-    timestamp = measurements[:timestamp]
+    # Check if ETS table exists before inserting
+    if :ets.whereis(:telemetry_metrics) != :undefined do
+      key = {:storage_write, metadata[:topic], metadata[:partition]}
+      timestamp = measurements[:timestamp]
 
-    :ets.insert(:telemetry_metrics, {
-      {key, timestamp},
-      measurements[:bytes],
-      measurements[:duration_ms]
-    })
+      :ets.insert(:telemetry_metrics, {
+        {key, timestamp},
+        measurements[:bytes],
+        measurements[:duration_ms]
+      })
+    end
   end
 
   defp handle_storage_read(_event, measurements, metadata, _config) do
-    key = {:storage_read, metadata[:topic], metadata[:partition]}
-    timestamp = measurements[:timestamp]
+    # Check if ETS table exists before inserting
+    if :ets.whereis(:telemetry_metrics) != :undefined do
+      key = {:storage_read, metadata[:topic], metadata[:partition]}
+      timestamp = measurements[:timestamp]
 
-    :ets.insert(:telemetry_metrics, {
-      {key, timestamp},
-      measurements[:bytes],
-      measurements[:duration_ms]
-    })
+      :ets.insert(:telemetry_metrics, {
+        {key, timestamp},
+        measurements[:bytes],
+        measurements[:duration_ms]
+      })
+    end
   end
 
   defp start_metrics_flow do
