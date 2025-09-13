@@ -14,9 +14,14 @@ defmodule Kafkaesque.Topic.SupervisorTest do
     Application.put_env(:kafkaesque_core, :offsets_dir, Path.join(test_dir, "offsets"))
 
     # Start the topic supervisor if not already started
-    case TopicSupervisor.start_link([]) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
+    case Process.whereis(TopicSupervisor) do
+      nil ->
+        case TopicSupervisor.start_link([]) do
+          {:ok, pid} -> {:ok, pid}
+          {:error, {:already_started, pid}} -> {:ok, pid}
+        end
+      pid ->
+        {:ok, pid}
     end
 
     on_exit(fn ->

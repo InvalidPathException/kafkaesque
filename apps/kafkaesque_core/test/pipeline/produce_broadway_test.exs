@@ -67,13 +67,15 @@ defmodule Kafkaesque.Pipeline.ProduceBroadwayTest do
           max_queue_size: 100
         )
 
-      {:ok, _pid} =
-        ProduceBroadway.start_link(
-          topic: @test_topic,
-          partition: @test_partition,
-          batch_size: 5,
-          batch_timeout: 1
-        )
+      case ProduceBroadway.start_link(
+             topic: @test_topic,
+             partition: @test_partition,
+             batch_size: 5,
+             batch_timeout: 1
+           ) do
+        {:ok, _pid} -> :ok
+        {:error, {:already_started, _pid}} -> :ok
+      end
 
       :ok
     end
@@ -266,13 +268,15 @@ defmodule Kafkaesque.Pipeline.ProduceBroadwayTest do
           max_queue_size: 100
         )
 
-      {:ok, _pid} =
-        ProduceBroadway.start_link(
-          topic: @test_topic,
-          partition: @test_partition,
-          batch_size: 5,
-          batch_timeout: 1
-        )
+      case ProduceBroadway.start_link(
+             topic: @test_topic,
+             partition: @test_partition,
+             batch_size: 5,
+             batch_timeout: 1
+           ) do
+        {:ok, _pid} -> :ok
+        {:error, {:already_started, _pid}} -> :ok
+      end
 
       :ok
     end
