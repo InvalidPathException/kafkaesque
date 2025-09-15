@@ -29,10 +29,7 @@ defmodule KafkaesqueCore.MixProject do
 
   defp deps do
     [
-      {:broadway, "~> 1.0"},
-      {:flow, "~> 1.2"},
-      {:membrane_core, "~> 1.0"},
-      {:membrane_file_plugin, "~> 0.17"},
+      {:gen_stage, "~> 1.2"},
       {:telemetry, "~> 1.2"},
       {:telemetry_metrics, "~> 1.0"},
       {:telemetry_poller, "~> 1.0"},

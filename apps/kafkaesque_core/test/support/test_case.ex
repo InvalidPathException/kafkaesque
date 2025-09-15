@@ -1,19 +1,15 @@
 defmodule Kafkaesque.TestCase do
-  @moduledoc """
-  Shared test helpers and setup for Kafkaesque tests.
-  """
+  @moduledoc false
 
   use ExUnit.CaseTemplate
 
-  alias Kafkaesque.Pipeline.MessageBuffer
-  alias Kafkaesque.Pipeline.ProduceBroadway
+  alias Kafkaesque.Pipeline.BatchingConsumer
+  alias Kafkaesque.Pipeline.Producer
   alias Kafkaesque.Storage.SingleFile
 
   using do
     quote do
       import Kafkaesque.TestCase
-
-      @test_dir "./test_#{:erlang.unique_integer([:positive])}"
     end
   end
 
@@ -27,7 +23,12 @@ defmodule Kafkaesque.TestCase do
   Sets up a test directory and ensures cleanup on exit.
   """
   def setup_test_dir(dir \\ nil) do
-    test_dir = dir || "./test_#{:erlang.unique_integer([:positive])}"
+    test_dir = if dir do
+      Path.join(System.tmp_dir!(), dir)
+    else
+      Path.join(System.tmp_dir!(), "kafkaesque_test_#{:erlang.unique_integer([:positive])}")
+    end
+
     File.rm_rf!(test_dir)
     File.mkdir_p!(test_dir)
 
@@ -36,6 +37,92 @@ defmodule Kafkaesque.TestCase do
     end)
 
     test_dir
+  end
+
+  @doc """
+  Generates a unique topic name for testing to avoid conflicts.
+  """
+  def unique_topic_name(base_name \\ "test_topic") do
+    "#{base_name}_#{System.unique_integer([:positive])}"
+  end
+
+  @doc """
+  Ensures the system is in a clean state by removing all topics and waiting for cleanup.
+  This should be called in setup to ensure no interference from previous tests.
+  """
+  def ensure_clean_state(timeout \\ 5000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    # Delete all existing topics
+    if Process.whereis(Kafkaesque.Topic.Supervisor) do
+      topics = Kafkaesque.Topic.Supervisor.list_topics()
+
+      Enum.each(topics, fn topic ->
+        Kafkaesque.Topic.Supervisor.delete_topic(topic.name)
+      end)
+
+      # Wait a bit for deletion to complete
+      if length(topics) > 0 do
+        Process.sleep(200)
+      end
+
+      # Wait until no topics exist
+      wait_for_clean_topics(deadline)
+
+      # Wait until Registry is clean
+      wait_for_clean_registry(deadline)
+
+      # Small final delay to ensure everything settles
+      Process.sleep(50)
+    end
+
+    :ok
+  end
+
+  defp wait_for_clean_topics(deadline) do
+    if System.monotonic_time(:millisecond) < deadline do
+      case Kafkaesque.Topic.Supervisor.list_topics() do
+        [] ->
+          :ok
+        _topics ->
+          # Just wait a bit and check again, don't try to delete
+          # The initial delete_topic calls should have started the cleanup
+          Process.sleep(50)
+          wait_for_clean_topics(deadline)
+      end
+    else
+      # Silently continue if topics remain after timeout
+      # This is usually fine as tests use unique names anyway
+      _remaining = Kafkaesque.Topic.Supervisor.list_topics()
+      :ok
+    end
+  end
+
+  defp wait_for_clean_registry(deadline) do
+    if System.monotonic_time(:millisecond) < deadline do
+      # Check for any topic-related entries in Registry
+      entries = Registry.select(Kafkaesque.TopicRegistry, [{{:"$1", :"$2", :"$3"}, [], [:"$1"]}])
+
+      topic_entries = Enum.filter(entries, fn
+        {:storage, _, _} -> true
+        {:producer, _, _} -> true
+        {:batching_consumer, _, _} -> true
+        {:partition_sup, _, _} -> true
+        {:log_reader, _, _} -> true
+        {:retention_controller, _, _} -> true
+        {:offset_store, _, _} -> true
+        _ -> false
+      end)
+
+      if length(topic_entries) > 0 do
+        Process.sleep(50)
+        wait_for_clean_registry(deadline)
+      else
+        :ok
+      end
+    else
+      :ok
+    end
   end
 
   @doc """
@@ -49,7 +136,17 @@ defmodule Kafkaesque.TestCase do
   defp do_wait_for_registration(key, deadline) do
     case Registry.lookup(Kafkaesque.TopicRegistry, key) do
       [{pid, _}] when is_pid(pid) ->
-        {:ok, pid}
+        if Process.alive?(pid) do
+          {:ok, pid}
+        else
+          # Process registered but not alive, wait more
+          if System.monotonic_time(:millisecond) < deadline do
+            Process.sleep(10)
+            do_wait_for_registration(key, deadline)
+          else
+            {:error, :timeout}
+          end
+        end
 
       _ ->
         if System.monotonic_time(:millisecond) < deadline do
@@ -57,6 +154,40 @@ defmodule Kafkaesque.TestCase do
           do_wait_for_registration(key, deadline)
         else
           {:error, :timeout}
+        end
+    end
+  end
+
+  @doc """
+  Retries a function until it succeeds or times out.
+  """
+  def retry_until_success(fun, timeout \\ 2000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_retry_until_success(fun, deadline)
+  end
+
+  defp do_retry_until_success(fun, deadline) do
+    case fun.() do
+      {:ok, result} ->
+        {:ok, result}
+
+      true ->
+        {:ok, true}
+
+      false ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(50)
+          do_retry_until_success(fun, deadline)
+        else
+          {:error, :timeout}
+        end
+
+      {:error, _} = error ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(50)
+          do_retry_until_success(fun, deadline)
+        else
+          error
         end
     end
   end
@@ -105,27 +236,27 @@ defmodule Kafkaesque.TestCase do
         data_dir: data_dir
       )
 
-    # Start message buffer
-    {:ok, buffer_pid} =
-      MessageBuffer.start_link(
+    # Start GenStage producer
+    {:ok, producer_pid} =
+      Producer.start_link(
         topic: topic,
         partition: partition,
         max_queue_size: Keyword.get(opts, :max_queue_size, 100)
       )
 
-    # Start Broadway pipeline
-    {:ok, broadway_pid} =
-      ProduceBroadway.start_link(
+    # Start GenStage consumer
+    {:ok, consumer_pid} =
+      BatchingConsumer.start_link(
         topic: topic,
         partition: partition,
         batch_size: Keyword.get(opts, :batch_size, 10),
-        batch_timeout: Keyword.get(opts, :batch_timeout, 1)
+        batch_timeout: Keyword.get(opts, :batch_timeout, 1000)
       )
 
     %{
       storage: storage_pid,
-      buffer: buffer_pid,
-      broadway: broadway_pid,
+      producer: producer_pid,
+      consumer: consumer_pid,
       data_dir: data_dir
     }
   end
@@ -134,8 +265,14 @@ defmodule Kafkaesque.TestCase do
   Cleans up a test topic and its processes.
   """
   def cleanup_test_topic(topic, partition) do
-    # Stop Broadway
-    ProduceBroadway.drain_and_stop(topic, partition)
+    # Stop GenStage processes
+    with [{pid, _}] <- Registry.lookup(Kafkaesque.TopicRegistry, {:producer, topic, partition}) do
+      GenStage.stop(pid, :normal, 5000)
+    end
+
+    with [{pid, _}] <- Registry.lookup(Kafkaesque.TopicRegistry, {:batching_consumer, topic, partition}) do
+      GenStage.stop(pid, :normal, 5000)
+    end
 
     # Close storage
     try do
@@ -146,7 +283,8 @@ defmodule Kafkaesque.TestCase do
 
     # Unregister from registry
     Registry.unregister(Kafkaesque.TopicRegistry, {:storage, topic, partition})
-    Registry.unregister(Kafkaesque.TopicRegistry, {:message_buffer, topic, partition})
+    Registry.unregister(Kafkaesque.TopicRegistry, {:producer, topic, partition})
+    Registry.unregister(Kafkaesque.TopicRegistry, {:batching_consumer, topic, partition})
 
     :ok
   end

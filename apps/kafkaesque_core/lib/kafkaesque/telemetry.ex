@@ -1,7 +1,7 @@
 defmodule Kafkaesque.Telemetry do
   @moduledoc """
   Telemetry event definitions and metrics aggregation for Kafkaesque.
-  Uses Flow for window-based aggregation of metrics.
+  Uses ETS-based aggregation with periodic window calculation.
   """
 
   use GenServer
@@ -9,6 +9,8 @@ defmodule Kafkaesque.Telemetry do
 
   @metrics_window_ms 5_000
   @percentiles [50, 95, 99]
+  @max_metrics_entries 10_000
+  @cleanup_threshold 12_000
 
   # Telemetry event names
   @message_produced [:kafkaesque, :message, :produced]
@@ -27,10 +29,9 @@ defmodule Kafkaesque.Telemetry do
   defmodule State do
     @moduledoc false
     defstruct [
-      :flow_pid,
       :metrics_table,
-      :subscribers,
-      :aggregated_metrics
+      :aggregated_metrics,
+      :last_aggregation
     ]
   end
 
@@ -49,6 +50,13 @@ defmodule Kafkaesque.Telemetry do
     }
 
     :telemetry.execute(@message_produced, measurements, metadata)
+  end
+
+  @doc """
+  Execute a telemetry event (for compatibility with new pipeline).
+  """
+  def execute(event_name, measurements, metadata) do
+    :telemetry.execute(event_name, measurements, metadata)
   end
 
   @doc """
@@ -253,17 +261,13 @@ defmodule Kafkaesque.Telemetry do
     # Attach telemetry handlers
     attach_handlers()
 
-    # Start Flow for metrics aggregation
-    flow_pid = start_metrics_flow()
-
     # Schedule periodic aggregation
     schedule_aggregation()
 
     state = %State{
-      flow_pid: flow_pid,
       metrics_table: table,
-      subscribers: [],
-      aggregated_metrics: %{}
+      aggregated_metrics: %{},
+      last_aggregation: System.system_time(:millisecond)
     }
 
     {:ok, state}
@@ -276,8 +280,7 @@ defmodule Kafkaesque.Telemetry do
 
   @impl true
   def handle_info(:aggregate_metrics, state) do
-    # Trigger Flow window completion
-    # In a real implementation, we'd use Flow's windowing
+    # Calculate aggregated metrics from ETS table
     metrics = calculate_aggregated_metrics(state.metrics_table)
 
     # Broadcast to subscribers
@@ -290,33 +293,114 @@ defmodule Kafkaesque.Telemetry do
     # Schedule next aggregation
     schedule_aggregation()
 
-    {:noreply, %{state | aggregated_metrics: metrics}}
+    {:noreply,
+     %{state | aggregated_metrics: metrics, last_aggregation: System.system_time(:millisecond)}}
   end
 
   defp attach_handlers do
-    handlers = [
-      {@message_produced, &handle_message_produced/4},
-      {@message_consumed, &handle_message_consumed/4},
-      {@topic_created, &handle_topic_created/4},
-      {@topic_deleted, &handle_topic_deleted/4},
-      {@consumer_joined, &handle_consumer_joined/4},
-      {@consumer_left, &handle_consumer_left/4},
-      {@rebalance_started, &handle_rebalance_started/4},
-      {@rebalance_completed, &handle_rebalance_completed/4},
-      {@offset_committed, &handle_offset_committed/4},
-      {@lag_measured, &handle_lag_measured/4},
-      {@storage_write, &handle_storage_write/4},
-      {@storage_read, &handle_storage_read/4}
-    ]
+    # Attach handlers using module functions to avoid performance warnings
+    :telemetry.attach(
+      "message-produced-handler",
+      @message_produced,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
 
-    Enum.each(handlers, fn {event, handler} ->
-      :telemetry.attach(
-        "#{inspect(event)}-handler",
-        event,
-        handler,
-        nil
-      )
-    end)
+    :telemetry.attach(
+      "message-consumed-handler",
+      @message_consumed,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "topic-created-handler",
+      @topic_created,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "topic-deleted-handler",
+      @topic_deleted,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "consumer-joined-handler",
+      @consumer_joined,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "consumer-left-handler",
+      @consumer_left,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "rebalance-started-handler",
+      @rebalance_started,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "rebalance-completed-handler",
+      @rebalance_completed,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "offset-committed-handler",
+      @offset_committed,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "lag-measured-handler",
+      @lag_measured,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "storage-write-handler",
+      @storage_write,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+
+    :telemetry.attach(
+      "storage-read-handler",
+      @storage_read,
+      &__MODULE__.telemetry_handler/4,
+      nil
+    )
+  end
+
+  @doc false
+  def telemetry_handler(event, measurements, metadata, _config) do
+    case event do
+      @message_produced -> handle_message_produced(event, measurements, metadata, nil)
+      @message_consumed -> handle_message_consumed(event, measurements, metadata, nil)
+      @topic_created -> handle_topic_created(event, measurements, metadata, nil)
+      @topic_deleted -> handle_topic_deleted(event, measurements, metadata, nil)
+      @consumer_joined -> handle_consumer_joined(event, measurements, metadata, nil)
+      @consumer_left -> handle_consumer_left(event, measurements, metadata, nil)
+      @rebalance_started -> handle_rebalance_started(event, measurements, metadata, nil)
+      @rebalance_completed -> handle_rebalance_completed(event, measurements, metadata, nil)
+      @offset_committed -> handle_offset_committed(event, measurements, metadata, nil)
+      @lag_measured -> handle_lag_measured(event, measurements, metadata, nil)
+      @storage_write -> handle_storage_write(event, measurements, metadata, nil)
+      @storage_read -> handle_storage_read(event, measurements, metadata, nil)
+      _ -> :ok
+    end
   end
 
   defp handle_message_produced(_event, measurements, metadata, _config) do
@@ -330,6 +414,9 @@ defmodule Kafkaesque.Telemetry do
         measurements[:count],
         measurements[:bytes]
       })
+
+      # Check if cleanup is needed
+      maybe_cleanup_metrics()
     end
   end
 
@@ -344,6 +431,9 @@ defmodule Kafkaesque.Telemetry do
         measurements[:bytes],
         measurements[:latency_ms]
       })
+
+      # Check if cleanup is needed
+      maybe_cleanup_metrics()
     end
   end
 
@@ -408,6 +498,9 @@ defmodule Kafkaesque.Telemetry do
         measurements[:bytes],
         measurements[:duration_ms]
       })
+
+      # Check if cleanup is needed
+      maybe_cleanup_metrics()
     end
   end
 
@@ -423,15 +516,6 @@ defmodule Kafkaesque.Telemetry do
         measurements[:duration_ms]
       })
     end
-  end
-
-  defp start_metrics_flow do
-    # Mock Flow pipeline for metrics aggregation
-    # In a real implementation, this would use Flow.from_enumerable
-    # with windows and aggregation
-    spawn_link(fn ->
-      Process.sleep(:infinity)
-    end)
   end
 
   defp calculate_aggregated_metrics(table) do
@@ -544,5 +628,42 @@ defmodule Kafkaesque.Telemetry do
 
   defp schedule_aggregation do
     Process.send_after(self(), :aggregate_metrics, @metrics_window_ms)
+  end
+
+  defp maybe_cleanup_metrics do
+    table = :telemetry_metrics
+
+    if :ets.info(table, :size) > @cleanup_threshold do
+      # Force cleanup of old metrics
+      now = System.system_time(:millisecond)
+      # Keep 2 windows worth of data
+      cutoff = now - @metrics_window_ms * 2
+
+      deleted =
+        :ets.select_delete(table, [
+          {{{:_, :"$1"}, :_}, [{:<, :"$1", cutoff}], [true]}
+        ])
+
+      if deleted > 0 do
+        Logger.debug("Telemetry cleanup: removed #{deleted} old entries")
+      end
+
+      # If still too many entries, remove oldest
+      if :ets.info(table, :size) > @max_metrics_entries do
+        entries =
+          :ets.tab2list(table)
+          |> Enum.sort_by(fn {{_key, timestamp}, _data} -> timestamp end)
+
+        to_remove = length(entries) - @max_metrics_entries
+
+        if to_remove > 0 do
+          entries
+          |> Enum.take(to_remove)
+          |> Enum.each(fn {key, _} -> :ets.delete(table, key) end)
+
+          Logger.warning("Telemetry: Forced removal of #{to_remove} entries to stay under limit")
+        end
+      end
+    end
   end
 end

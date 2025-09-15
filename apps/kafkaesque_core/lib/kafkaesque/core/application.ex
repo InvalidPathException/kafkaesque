@@ -9,7 +9,8 @@ defmodule Kafkaesque.Core.Application do
       {Registry, keys: :unique, name: Kafkaesque.TopicRegistry},
       Kafkaesque.Topic.Supervisor,
       {Phoenix.PubSub, name: Kafkaesque.PubSub, adapter: Phoenix.PubSub.PG2},
-      Kafkaesque.Telemetry.Supervisor
+      Kafkaesque.Telemetry.Supervisor,
+      Kafkaesque.Telemetry
     ]
 
     opts = [strategy: :one_for_one, name: Kafkaesque.Core.Supervisor]

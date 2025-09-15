@@ -1,7 +1,37 @@
 defmodule Kafkaesque.Storage.SingleFile do
   @moduledoc """
   Single append-only file storage per topic/partition.
-  Implements binary framing with magic byte, attributes, and timestamps.
+  Implements binary framing with magic byte, CRC validation, attributes, and timestamps.
+
+  ## Frame Format
+
+  Each record is stored as a binary frame with the following structure:
+
+  ```
+  +-------------------+------------------+
+  | Frame Length (4B) | Frame Content    |
+  +-------------------+------------------+
+
+  Frame Content:
+  +-----------+--------------+------------+------------------+--------------+
+  | Magic (1B)| CRC (4B)     | Attr (1B)  | TS_MS (8B)       | Key_Len (4B) |
+  +-----------+--------------+------------+------------------+--------------+
+  | Key       | Val_Len (4B) | Value      | Headers_Len (2B) | Headers      |
+  +-----------+--------------+------------+------------------+--------------+
+  ```
+
+  ## CRC Validation
+
+  The CRC32 checksum is calculated over all frame content AFTER the CRC field itself.
+  This includes:
+  - Attributes (1 byte)
+  - Timestamp (8 bytes)
+  - Key length and key
+  - Value length and value
+  - Headers length and headers
+
+  The CRC is stored as a 4-byte big-endian integer immediately after the magic byte.
+  On read, the CRC is recalculated and compared to detect corruption.
   """
 
   use GenServer
@@ -233,8 +263,10 @@ defmodule Kafkaesque.Storage.SingleFile do
         {0, 0, index}
 
       {:ok, %{size: size}} when size > 0 ->
-        {:ok, data} = :file.pread(file, 0, size)
-        {offset, position, updated_index} = rebuild_from_data(data, index, 0, 0, 0)
+        # Stream the file in chunks to avoid loading entire file into memory
+        # 1MB chunks
+        chunk_size = 1024 * 1024
+        {offset, position, updated_index} = rebuild_index_streaming(file, size, chunk_size, index)
         {offset, position, updated_index}
 
       {:error, :enoent} ->
@@ -247,39 +279,103 @@ defmodule Kafkaesque.Storage.SingleFile do
     end
   end
 
-  defp rebuild_from_data(<<>>, index, offset, position, _) do
+  defp rebuild_index_streaming(file, total_size, chunk_size, index) do
+    rebuild_index_streaming(file, 0, total_size, chunk_size, index, 0, 0, 0, <<>>)
+  end
+
+  defp rebuild_index_streaming(
+         _file,
+         read_pos,
+         total_size,
+         _chunk_size,
+         index,
+         offset,
+         position,
+         _bytes_since_index,
+         leftover
+       )
+       when read_pos >= total_size do
+    # Process any leftover data
+    if byte_size(leftover) > 0 do
+      Logger.warning("Truncating incomplete frame at end of file (#{byte_size(leftover)} bytes)")
+    end
+
     {offset, position, index}
   end
 
-  defp rebuild_from_data(data, index, offset, position, bytes_since_index) do
+  defp rebuild_index_streaming(
+         file,
+         read_pos,
+         total_size,
+         chunk_size,
+         index,
+         offset,
+         position,
+         bytes_since_index,
+         leftover
+       ) do
+    # Read next chunk
+    bytes_to_read = min(chunk_size, total_size - read_pos)
+    {:ok, chunk} = :file.pread(file, read_pos, bytes_to_read)
+
+    # Combine leftover from previous chunk with new data
+    data = <<leftover::binary, chunk::binary>>
+
+    # Process complete frames in this chunk
+    {new_offset, new_position, new_index, new_bytes_since_index, new_leftover} =
+      process_chunk_frames(data, index, offset, position, bytes_since_index)
+
+    # Continue with next chunk
+    rebuild_index_streaming(
+      file,
+      read_pos + bytes_to_read,
+      total_size,
+      chunk_size,
+      new_index,
+      new_offset,
+      new_position,
+      new_bytes_since_index,
+      new_leftover
+    )
+  end
+
+  defp process_chunk_frames(data, index, offset, position, bytes_since_index) do
+    process_chunk_frames(data, index, offset, position, bytes_since_index, 0)
+  end
+
+  defp process_chunk_frames(data, index, offset, position, bytes_since_index, processed_in_chunk) do
     case parse_single_frame(data) do
       {:ok, frame_size, _record, rest} ->
-        # Always index the first record, then sparse index
-        if offset == 0 or rem(offset, Constants.index_interval()) == 0 or
-             bytes_since_index >= Constants.index_bytes_threshold() do
-          updated_index = Index.add(index, offset, position, frame_size)
+        # Update index if needed
+        new_index =
+          if offset == 0 or rem(offset, Constants.index_interval()) == 0 or
+               bytes_since_index >= Constants.index_bytes_threshold() do
+            Index.add(index, offset, position, frame_size)
+          else
+            index
+          end
 
-          rebuild_from_data(
-            rest,
-            updated_index,
-            offset + 1,
-            position + frame_size + Constants.frame_header_size(),
-            0
-          )
-        else
-          rebuild_from_data(
-            rest,
-            index,
-            offset + 1,
-            position + frame_size + Constants.frame_header_size(),
-            bytes_since_index + frame_size
-          )
-        end
+        new_bytes_since_index = if new_index != index, do: 0, else: bytes_since_index + frame_size
+
+        # Continue processing rest of chunk
+        process_chunk_frames(
+          rest,
+          new_index,
+          offset + 1,
+          position + frame_size + Constants.frame_header_size(),
+          new_bytes_since_index,
+          processed_in_chunk + frame_size + Constants.frame_header_size()
+        )
 
       {:error, :incomplete} ->
-        # Corrupted tail, truncate
-        Logger.warning("Truncating corrupted tail at offset #{offset}")
-        {offset, position, index}
+        # Can't parse complete frame, return leftover for next chunk
+        {offset, position, index, bytes_since_index, data}
+
+      {:error, reason} ->
+        # Log corruption and skip this frame
+        Logger.warning("Skipping corrupted frame at offset #{offset}: #{reason}")
+        # Return what we've processed so far
+        {offset, position, index, bytes_since_index, <<>>}
     end
   end
 
@@ -434,6 +530,11 @@ defmodule Kafkaesque.Storage.SingleFile do
         parse_frames(rest, offset + 1, max_bytes, bytes_read + frame_size, [record | acc])
 
       {:error, :incomplete} ->
+        Enum.reverse(acc)
+
+      {:error, reason} ->
+        # Log the error and return what we've read so far
+        Logger.warning("Error parsing frame at offset #{offset}: #{reason}")
         Enum.reverse(acc)
     end
   end

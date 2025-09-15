@@ -22,77 +22,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 kafkaesque-*.tar
 
-# Ignore assets that are produced by build tools.
-/priv/static/
-
-# Ignore digested assets cache.
-/priv/static/cache_manifest.json
-
-# In case you use Node.js/npm, you want to ignore these.
-npm-debug.log
-/assets/node_modules/
-
-# Database files
-*.db
-*.db-*
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Editor directories and files
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Elixir Language Server
-/.elixir_ls/
-
-# Data directories (for local development)
-/data/
-/offsets/
-
-# Environment files
-.env
-.env.*
-
-# Release artifacts
-/rel/artifacts/
-
-# Temporary files
-*.tmp
-/tmp/# The directory Mix will write compiled artifacts to.
-/_build/
-
-# If you run "mix test --cover", coverage assets end up here.
-/cover/
-
-# The directory Mix downloads your dependencies sources to.
-/deps/
-
-# Where 3rd-party dependencies like ExDoc output generated docs.
-/doc/
-
-# Ignore .fetch files in case you like to edit your project deps locally.
-/.fetch
-
-# If the VM crashes, it generates a dump, let's ignore it too.
-erl_crash.dump
-
-# Also ignore archive artifacts (built via "mix archive.build").
-*.ez
-
-# Ignore package tarball (built via "mix hex.build").
-kafkaesque-*.tar
-
-# Ignore assets that are produced by build tools.
-/priv/static/
-
-# Ignore digested assets cache.
-/priv/static/cache_manifest.json
-
 # Node.js/npm
 npm-debug.log
 node_modules/
@@ -108,15 +37,14 @@ node_modules/
 esbuild.meta.json
 
 # Generated assets
-/apps/*/priv/static/assets/
 /apps/*/priv/static/*.html
 /apps/*/priv/static/*.html.gz
-/apps/*/priv/static/cache_manifest.json
 /apps/*/priv/server/
 
 # Database files
 *.db
 *.db-*
+*.dets
 
 # OS files
 .DS_Store
@@ -135,6 +63,12 @@ Thumbs.db
 # Data directories (for local development)
 /data/
 /offsets/
+
+# Test artifacts
+/test_data_*/
+/apps/*/test_data*/
+/apps/*/test_data/
+test_simple.exs
 
 # Environment files
 .env

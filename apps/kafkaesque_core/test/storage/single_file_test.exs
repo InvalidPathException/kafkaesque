@@ -24,7 +24,7 @@ defmodule Kafkaesque.Storage.SingleFileTest do
   end
 
   defp setup_test_dir do
-    test_dir = "./test_#{:erlang.unique_integer([:positive])}"
+    test_dir = Path.join(System.tmp_dir!(), "kafkaesque_test_#{:erlang.unique_integer([:positive])}")
     File.rm_rf!(test_dir)
     File.mkdir_p!(test_dir)
     on_exit(fn -> File.rm_rf!(test_dir) end)

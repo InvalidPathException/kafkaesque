@@ -7,7 +7,6 @@ defmodule Kafkaesque.Topic.Supervisor do
   use DynamicSupervisor
   require Logger
 
-  alias Broadway
   alias Kafkaesque.Telemetry
 
   def start_link(init_arg) do
@@ -23,7 +22,7 @@ defmodule Kafkaesque.Topic.Supervisor do
   Creates a new topic with the specified number of partitions.
   """
   def create_topic(name, partitions \\ 1) when is_binary(name) and partitions > 0 do
-    Logger.info("Creating topic '#{name}' with #{partitions} partitions")
+    Logger.debug("Creating topic '#{name}' with #{partitions} partitions")
 
     # Start supervisor for each partition
     results =
@@ -36,6 +35,7 @@ defmodule Kafkaesque.Topic.Supervisor do
       nil ->
         # Emit telemetry
         Telemetry.topic_created(name, partitions)
+        Logger.debug("Topic created: #{name} with #{partitions} partitions")
         {:ok, %{topic: name, partitions: partitions}}
 
       {:error, reason} ->
@@ -53,98 +53,67 @@ defmodule Kafkaesque.Topic.Supervisor do
   Deletes a topic and all its partitions.
   """
   def delete_topic(name) when is_binary(name) do
-    Logger.info("Deleting topic '#{name}'")
+    Logger.debug("Deleting topic '#{name}'")
 
-    # Find all Registry entries for this topic (including MessageBuffer, Broadway, etc.)
-    all_keys =
-      Registry.select(Kafkaesque.TopicRegistry, [
-        {{:"$1", :_, :_}, [], [:"$1"]}
-      ])
-
-    # Filter for keys related to this topic
-    topic_keys =
-      Enum.filter(all_keys, fn
-        {:storage, ^name, _partition} -> true
-        {:message_buffer, ^name, _partition} -> true
-        {:partition_sup, ^name, _partition} -> true
-        {:log_reader, ^name, _partition} -> true
-        {:retention_controller, ^name, _partition} -> true
-        _ -> false
-      end)
-
-    # Stop and unregister all processes
-    Enum.each(topic_keys, fn key ->
-      case Registry.lookup(Kafkaesque.TopicRegistry, key) do
-        [{pid, _}] ->
-          try do
-            if Process.alive?(pid) do
-              Process.exit(pid, :shutdown)
-            end
-          catch
-            _, _ -> :ok
-          end
-
-          Registry.unregister(Kafkaesque.TopicRegistry, key)
-
-        _ ->
-          :ok
-      end
-    end)
-
-    # Also stop Broadway which uses atom names
-    # Find all partitions for this topic
-    partitions =
-      Enum.flat_map(topic_keys, fn
-        {:storage, ^name, partition} -> [partition]
-        {:partition_sup, ^name, partition} -> [partition]
-        _ -> []
-      end)
-      |> Enum.uniq()
-
-    # Stop Broadway for each partition
-    Enum.each(partitions, fn partition ->
-      broadway_name = String.to_atom("broadway_#{name}_#{partition}")
-
-      try do
-        Broadway.stop(broadway_name, :normal, 5000)
-      catch
-        _, _ -> :ok
-      end
-    end)
-
-    # Find and stop all partition supervisors for this topic
-    partition_data =
+    # Find partition supervisors via Registry
+    partition_supervisors =
       Registry.select(Kafkaesque.TopicRegistry, [
         {{{:partition_sup, :"$1", :"$2"}, :"$3", :_}, [{:==, :"$1", name}], [{{:"$2", :"$3"}}]}
       ])
 
-    Logger.debug("Terminating #{length(partition_data)} partition supervisors for topic #{name}")
+    Logger.debug(
+      "Terminating #{length(partition_supervisors)} partition supervisors for topic #{name}"
+    )
 
-    Enum.each(partition_data, fn {_partition, pid} ->
-      try do
-        # Terminate the supervisor (this should clean up Registry entries automatically)
-        if Process.alive?(pid) do
-          DynamicSupervisor.terminate_child(__MODULE__, pid)
+    # Terminate each partition supervisor (this will cascade to all child processes)
+    partition_supervisors
+    |> Enum.each(fn {_partition, pid} ->
+      if is_pid(pid) and Process.alive?(pid) do
+        # Use synchronous termination via DynamicSupervisor
+        case DynamicSupervisor.terminate_child(__MODULE__, pid) do
+          :ok ->
+            # Wait for process to fully terminate
+            ref = Process.monitor(pid)
 
-          # Wait a bit for cleanup
-          Process.sleep(50)
+            receive do
+              {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+            after
+              1000 ->
+                Process.demonitor(ref, [:flush])
+                Logger.warning("Timeout waiting for partition supervisor to terminate")
+            end
+
+          error ->
+            Logger.warning("Failed to terminate partition supervisor: #{inspect(error)}")
         end
-      catch
-        _, _ -> :ok
       end
     end)
 
-    # Double-check and force cleanup any remaining entries
+    # Clean up any stale Registry entries for this topic
     Registry.select(Kafkaesque.TopicRegistry, [
-      {{{:partition_sup, :"$1", :"$2"}, :"$3", :_}, [{:==, :"$1", name}],
-       [{{:partition_sup, :"$1", :"$2"}}]}
+      {{:"$1", :_, :_}, [], [:"$1"]}
     ])
+    |> Enum.filter(fn
+      {:storage, ^name, _} -> true
+      {:producer, ^name, _} -> true
+      {:batching_consumer, ^name, _} -> true
+      {:partition_sup, ^name, _} -> true
+      {:log_reader, ^name, _} -> true
+      {:retention_controller, ^name, _} -> true
+      {:offset_store, ^name, _} -> true
+      _ -> false
+    end)
     |> Enum.each(fn key ->
       Registry.unregister_match(Kafkaesque.TopicRegistry, key, :_)
     end)
 
+    # Small delay to ensure full cleanup
+    Process.sleep(10)
+
     # Emit telemetry
     Telemetry.topic_deleted(name)
+
+    Logger.debug("Topic deleted: #{name}")
 
     :ok
   end
@@ -191,7 +160,11 @@ defmodule Kafkaesque.Topic.Supervisor do
   Checks if a topic exists.
   """
   def topic_exists?(name) do
-    length(find_topic_partitions(name)) > 0
+    # Check if any partition supervisors are registered for this topic
+    Registry.select(Kafkaesque.TopicRegistry, [
+      {{{:partition_sup, :"$1", :_}, :_, :_}, [{:==, :"$1", name}], [true]}
+    ])
+    |> Enum.any?()
   end
 
   defp start_partition(topic, partition) do
@@ -251,50 +224,52 @@ defmodule Kafkaesque.Topic.Supervisor.PartitionSupervisor do
          data_dir: Application.get_env(:kafkaesque_core, :data_dir, "./data")
        ]},
 
-      # Message buffer for queueing
-      {Kafkaesque.Pipeline.MessageBuffer,
+      # GenStage Producer for message queueing
+      {Kafkaesque.Pipeline.Producer,
        [
          topic: topic,
          partition: partition,
          max_queue_size: Application.get_env(:kafkaesque_core, :max_queue_size, 10_000)
        ]},
 
-      # Broadway pipeline for batching and processing
-      {Kafkaesque.Pipeline.ProduceBroadway,
+      # GenStage BatchingConsumer for writing to storage
+      {Kafkaesque.Pipeline.BatchingConsumer,
        [
          topic: topic,
          partition: partition,
          batch_size: Application.get_env(:kafkaesque_core, :max_batch_size, 500),
          batch_timeout: Application.get_env(:kafkaesque_core, :batch_timeout, 5),
-         processor_concurrency: Application.get_env(:kafkaesque_core, :processor_concurrency, 10)
-       ]}
+         min_demand: Application.get_env(:kafkaesque_core, :min_demand, 5),
+         max_demand: Application.get_env(:kafkaesque_core, :max_batch_size, 500)
+       ]},
 
-      # TODO:
       # Log reader for consuming
-      # {Kafkaesque.Topic.LogReader,
-      #  [
-      #    topic: topic,
-      #    partition: partition
-      #  ]},
+      {Kafkaesque.Topic.LogReader,
+       [
+         topic: topic,
+         partition: partition
+       ]},
 
       # Offset storage
-      # {Kafkaesque.Offsets.DetsOffset,
-      #  [
-      #    topic: topic,
-      #    partition: partition,
-      #    offsets_dir: Application.get_env(:kafkaesque_core, :offsets_dir, "./offsets")
-      #  ]},
+      {Kafkaesque.Offsets.DetsOffset,
+       [
+         topic: topic,
+         partition: partition,
+         offsets_dir: Application.get_env(:kafkaesque_core, :offsets_dir, "./offsets")
+       ]},
 
       # Retention controller
-      # {Kafkaesque.Topic.RetentionController,
-      #  [
-      #    topic: topic,
-      #    partition: partition,
-      #    retention_hours: Application.get_env(:kafkaesque_core, :retention_hours, 168)
-      #  ]}
+      {Kafkaesque.Topic.RetentionController,
+       [
+         topic: topic,
+         partition: partition,
+         retention_ms:
+           Application.get_env(:kafkaesque_core, :retention_hours, 168) * 60 * 60 * 1000,
+         storage_path: Application.get_env(:kafkaesque_core, :data_dir, "./data")
+       ]}
     ]
 
-    Logger.info("Starting partition supervisor for #{topic}/#{partition}")
+    Logger.debug("Starting partition supervisor for #{topic}/#{partition}")
 
     Supervisor.init(children, strategy: :one_for_one)
   end
@@ -476,47 +451,70 @@ defmodule Kafkaesque.Offsets.DetsOffset do
   use GenServer
   require Logger
 
-  @table_name :consumer_offsets
-
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts)
+    topic = Keyword.fetch!(opts, :topic)
+    partition = Keyword.fetch!(opts, :partition)
+
+    GenServer.start_link(__MODULE__, opts, name: via_tuple(topic, partition))
   end
 
   @impl true
   def init(opts) do
+    topic = Keyword.fetch!(opts, :topic)
+    partition = Keyword.fetch!(opts, :partition)
     offsets_dir = Keyword.get(opts, :offsets_dir, "./offsets")
+
     File.mkdir_p!(offsets_dir)
 
-    file_path = Path.join(offsets_dir, "offsets.dets")
+    # Use topic-partition specific table name
+    table_name = :"offsets_#{topic}_#{partition}"
+    file_path = Path.join(offsets_dir, "#{topic}_#{partition}_offsets.dets")
 
     {:ok, table} =
-      :dets.open_file(@table_name,
+      :dets.open_file(table_name,
         file: String.to_charlist(file_path),
         type: :set
       )
 
-    {:ok, %{table: table, topic: opts[:topic], partition: opts[:partition]}}
+    {:ok, %{table: table, table_name: table_name, topic: topic, partition: partition}}
+  end
+
+  defp via_tuple(topic, partition) do
+    {:via, Registry, {Kafkaesque.TopicRegistry, {:offset_store, topic, partition}}}
   end
 
   def commit(topic, partition, group, offset) do
-    key = {topic, partition, group}
-    :dets.insert(@table_name, {key, offset})
-    Kafkaesque.Telemetry.offset_committed(group, topic, partition, offset)
-    :ok
+    GenServer.call(via_tuple(topic, partition), {:commit, group, offset})
   end
 
   def fetch(topic, partition, group) do
-    key = {topic, partition, group}
-
-    case :dets.lookup(@table_name, key) do
-      [{^key, offset}] -> {:ok, offset}
-      # Start from beginning
-      [] -> {:ok, 0}
-    end
+    GenServer.call(via_tuple(topic, partition), {:fetch, group})
   end
 
   @impl true
-  def terminate(_reason, _state) do
-    :dets.close(@table_name)
+  def handle_call({:commit, group, offset}, _from, state) do
+    key = {state.topic, state.partition, group}
+    :dets.insert(state.table_name, {key, offset})
+    Kafkaesque.Telemetry.offset_committed(group, state.topic, state.partition, offset)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:fetch, group}, _from, state) do
+    key = {state.topic, state.partition, group}
+
+    result =
+      case :dets.lookup(state.table_name, key) do
+        [{^key, offset}] -> {:ok, offset}
+        # Start from beginning
+        [] -> {:ok, 0}
+      end
+
+    {:reply, result, state}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    :dets.close(state.table_name)
   end
 end

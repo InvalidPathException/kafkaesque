@@ -27,5 +27,12 @@ if ! mix compile --warnings-as-errors; then
     exit 1
 fi
 
+echo "Checking for unused dependencies..."
+if ! mix deps.unlock --check-unused; then
+    echo "Unused dependencies found!"
+    echo "Run 'mix deps.unlock --check-unused' to see the unused dependencies"
+    exit 1
+fi
+
 echo "All pre-commit checks passed!"
 exit 0

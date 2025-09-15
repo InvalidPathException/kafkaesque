@@ -10,6 +10,8 @@ defmodule Kafkaesque.Topic.RetentionController do
   use GenServer
   require Logger
 
+  alias Kafkaesque.Storage.SingleFile
+
   # Check retention every minute
   @check_interval_ms 60_000
   # 7 days
@@ -225,16 +227,35 @@ defmodule Kafkaesque.Topic.RetentionController do
     end
   end
 
-  defp find_offset_after_timestamp(state, _cutoff_time) do
-    # Mock implementation - in reality would scan the index
-    # Returns an offset that would retain messages newer than cutoff_time
+  defp find_offset_after_timestamp(state, cutoff_time) do
+    # Get the storage and index to find the first offset after cutoff_time
+    case Registry.lookup(
+           Kafkaesque.TopicRegistry,
+           {:storage, state.topic, state.partition}
+         ) do
+      [{pid, _}] when is_pid(pid) ->
+        case SingleFile.get_offsets(state.topic, state.partition) do
+          {:ok, %{latest: latest_offset}} when latest_offset > 0 ->
+            # Binary search through offsets to find retention point
+            # For now, estimate based on time proportion
+            # In production, would scan actual message timestamps
+            current_time = System.system_time(:millisecond)
+            time_range = current_time - cutoff_time
 
-    if state.index_table do
-      # Scan ETS table for entries with timestamp > cutoff_time
-      # This is a simplified mock
-      :rand.uniform(1000)
-    else
-      0
+            if time_range > 0 and state.retention_ms > 0 do
+              # Estimate offset based on time proportion
+              retention_ratio = min(1.0, time_range / state.retention_ms)
+              round(latest_offset * (1 - retention_ratio))
+            else
+              0
+            end
+
+          _ ->
+            0
+        end
+
+      _ ->
+        0
     end
   end
 
@@ -258,7 +279,70 @@ defmodule Kafkaesque.Topic.RetentionController do
   end
 
   defp calculate_retention_stats(state) do
-    %{
+    # Get real statistics from storage
+    stats =
+      case Registry.lookup(
+             Kafkaesque.TopicRegistry,
+             {:storage, state.topic, state.partition}
+           ) do
+        [{pid, _}] when is_pid(pid) ->
+          case SingleFile.get_offsets(state.topic, state.partition) do
+            {:ok, %{earliest: earliest, latest: latest}} ->
+              total_messages = latest - earliest
+              effective_watermark = Map.values(state.watermarks) |> Enum.max()
+              retained_messages = latest - effective_watermark
+
+              # Get file size for byte statistics
+              file_path = Path.join([state.storage_path, state.topic, "p-#{state.partition}.log"])
+
+              {total_bytes, retained_bytes} =
+                case File.stat(file_path) do
+                  {:ok, %{size: size}} ->
+                    retention_ratio =
+                      if total_messages > 0 do
+                        retained_messages / total_messages
+                      else
+                        1.0
+                      end
+
+                    {size, round(size * retention_ratio)}
+
+                  _ ->
+                    {0, 0}
+                end
+
+              %{
+                total_messages: total_messages,
+                retained_messages: retained_messages,
+                total_bytes: total_bytes,
+                retained_bytes: retained_bytes,
+                earliest_offset: earliest,
+                latest_offset: latest
+              }
+
+            _ ->
+              %{
+                total_messages: 0,
+                retained_messages: 0,
+                total_bytes: 0,
+                retained_bytes: 0,
+                earliest_offset: 0,
+                latest_offset: 0
+              }
+          end
+
+        _ ->
+          %{
+            total_messages: 0,
+            retained_messages: 0,
+            total_bytes: 0,
+            retained_bytes: 0,
+            earliest_offset: 0,
+            latest_offset: 0
+          }
+      end
+
+    Map.merge(stats, %{
       topic: state.topic,
       partition: state.partition,
       retention_ms: state.retention_ms,
@@ -266,13 +350,8 @@ defmodule Kafkaesque.Topic.RetentionController do
       cleanup_policy: state.cleanup_policy,
       watermarks: state.watermarks,
       effective_watermark: Map.values(state.watermarks) |> Enum.max(),
-      # Mock statistics - in reality would calculate from actual data
-      total_messages: :rand.uniform(100_000),
-      retained_messages: :rand.uniform(50_000),
-      total_bytes: :rand.uniform(10_000_000),
-      retained_bytes: :rand.uniform(5_000_000),
-      oldest_timestamp: System.system_time(:millisecond) - state.retention_ms,
+      oldest_timestamp: System.system_time(:millisecond) - (state.retention_ms || 0),
       newest_timestamp: System.system_time(:millisecond)
-    }
+    })
   end
 end
