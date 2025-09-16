@@ -5,6 +5,8 @@ defmodule Kafkaesque.Pipeline.IntegrationTest do
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
 
+  import Kafkaesque.TestHelpers, only: [wait_for_messages: 4]
+
   setup do
     # Ensure clean state before test
     ensure_clean_state()
@@ -52,7 +54,7 @@ defmodule Kafkaesque.Pipeline.IntegrationTest do
 
       # Wait for messages to flow through pipeline
       # The batching consumer has a timeout of up to 5 seconds
-      batch_timeout = Application.get_env(:kafkaesque_core, :batch_timeout, 5) * 1000
+      batch_timeout = Application.get_env(:kafkaesque_core, :batch_timeout, 5000)
       Process.sleep(batch_timeout + 500)
 
       # Read messages from storage
@@ -112,12 +114,20 @@ defmodule Kafkaesque.Pipeline.IntegrationTest do
 
       {:ok, _} = Producer.produce(test_topic, test_partition, [message])
 
-      # Wait for batch timeout to ensure persistence
-      batch_timeout = Application.get_env(:kafkaesque_core, :batch_timeout, 5) * 1000
-      Process.sleep(batch_timeout + 1000)
+      # Wait for message to be written
+      assert :ok = wait_for_messages(test_topic, test_partition, 1, 2000)
+
+      # Give a bit more time for file sync
+      Process.sleep(100)
 
       # Read back and verify
-      {:ok, stored_messages} = SingleFile.read(test_topic, test_partition, 0, 10_000)
+      result = SingleFile.read(test_topic, test_partition, 0, 10_000)
+
+      # Handle both empty file and data cases
+      stored_messages = case result do
+        {:ok, messages} -> messages
+        {:error, :offset_out_of_range} -> []
+      end
       assert length(stored_messages) > 0, "No messages were stored"
       stored = hd(stored_messages)
 
@@ -142,14 +152,30 @@ defmodule Kafkaesque.Pipeline.IntegrationTest do
       {:ok, _} = Producer.produce(multi_topic, 1, msg_p1)
       {:ok, _} = Producer.produce(multi_topic, 2, msg_p2)
 
-      # Wait for batch timeout
-      batch_timeout = Application.get_env(:kafkaesque_core, :batch_timeout, 5) * 1000
-      Process.sleep(batch_timeout + 1000)
+      # Wait for messages to be written to all partitions (1 message each)
+      assert :ok = wait_for_messages(multi_topic, 0, 1, 3000)
+      assert :ok = wait_for_messages(multi_topic, 1, 1, 3000)
+      assert :ok = wait_for_messages(multi_topic, 2, 1, 3000)
+
+      # Give time for file sync
+      Process.sleep(200)
 
       # Verify each partition has its own message
-      {:ok, msgs_p0} = SingleFile.read(multi_topic, 0, 0, 10_000)
-      {:ok, msgs_p1} = SingleFile.read(multi_topic, 1, 0, 10_000)
-      {:ok, msgs_p2} = SingleFile.read(multi_topic, 2, 0, 10_000)
+      # Handle case where file might not exist yet or offset is 0
+      msgs_p0 = case SingleFile.read(multi_topic, 0, 0, 10_000) do
+        {:ok, msgs} -> msgs
+        {:error, :offset_out_of_range} -> []
+      end
+
+      msgs_p1 = case SingleFile.read(multi_topic, 1, 0, 10_000) do
+        {:ok, msgs} -> msgs
+        {:error, :offset_out_of_range} -> []
+      end
+
+      msgs_p2 = case SingleFile.read(multi_topic, 2, 0, 10_000) do
+        {:ok, msgs} -> msgs
+        {:error, :offset_out_of_range} -> []
+      end
 
       assert length(msgs_p0) > 0, "No messages in partition 0"
       assert length(msgs_p1) > 0, "No messages in partition 1"

@@ -8,16 +8,22 @@ config :kafkaesque_dashboard, KafkaesqueDashboard.Endpoint,
   server: false
 
 config :kafkaesque_server, KafkaesqueServer.Endpoint,
-  http: [ip: {127, 0, 0, 1}, port: 4003],
-  server: false
+  http: [ip: {127, 0, 0, 1}, port: 4001],
+  server: true
 
-# Core test settings
+config :kafkaesque_server,
+  start_grpc: false
+
+# Core test settings - optimized for immediate writes
 config :kafkaesque_core,
-  data_dir: "./test_data",
-  offsets_dir: "./test_offsets",
+  data_dir: "/tmp/kafkaesque_test/data",
+  offsets_dir: "/tmp/kafkaesque_test/offsets",
   retention_hours: 1,
   max_batch_size: 10,
-  batch_timeout: 1
+  # Immediate flush in tests
+  batch_timeout: 0,
+  # Immediate fsync in tests
+  fsync_interval_ms: 0
 
 # Print only warnings and errors during test
 config :logger, level: :warning

@@ -49,21 +49,22 @@ defmodule Kafkaesque.Storage.Index do
 
   @doc """
   Looks up the file position for a given offset.
-  Returns {:ok, file_position} or :not_found.
+  Returns {:ok, {file_position, actual_offset}} where actual_offset is the offset
+  of the index entry (which may be before the requested offset for sparse indexes),
+  or :not_found if the offset is out of range.
   """
   def lookup(%__MODULE__{} = index, offset) do
     cond do
       is_nil(index.min_offset) or is_nil(index.max_offset) ->
         :not_found
 
-      offset < index.min_offset or offset > index.max_offset ->
+      offset < index.min_offset ->
         :not_found
 
       true ->
-        case find_position(index.table, offset) do
-          {:ok, position} -> {:ok, position}
-          :not_found -> :not_found
-        end
+        # Don't check max_offset here - let SingleFile decide if offset is valid
+        # The index only contains sparse entries, not all offsets
+        find_position(index.table, offset)
     end
   end
 
@@ -139,7 +140,7 @@ defmodule Kafkaesque.Storage.Index do
   defp find_position(table, offset) do
     case :ets.lookup(table, offset) do
       [{^offset, {position, _length}}] ->
-        {:ok, position}
+        {:ok, {position, offset}}
 
       [] ->
         find_closest_before(table, offset)
@@ -150,22 +151,16 @@ defmodule Kafkaesque.Storage.Index do
     case :ets.prev(table, target_offset) do
       :"$end_of_table" ->
         if target_offset == 0 do
-          {:ok, 0}
+          {:ok, {0, 0}}
         else
           :not_found
         end
 
       prev_offset ->
-        [{^prev_offset, {position, length}}] = :ets.lookup(table, prev_offset)
-
-        offset_delta = target_offset - prev_offset
-
-        if offset_delta == 0 do
-          {:ok, position}
-        else
-          estimated_position = position + length
-          {:ok, estimated_position}
-        end
+        [{^prev_offset, {position, _length}}] = :ets.lookup(table, prev_offset)
+        # Return the position and offset of the closest entry before the target offset
+        # SingleFile will scan forward from this position to find the exact offset
+        {:ok, {position, prev_offset}}
     end
   end
 

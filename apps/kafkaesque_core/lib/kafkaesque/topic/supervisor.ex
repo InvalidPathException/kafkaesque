@@ -238,7 +238,7 @@ defmodule Kafkaesque.Topic.Supervisor.PartitionSupervisor do
          topic: topic,
          partition: partition,
          batch_size: Application.get_env(:kafkaesque_core, :max_batch_size, 500),
-         batch_timeout: Application.get_env(:kafkaesque_core, :batch_timeout, 5),
+         batch_timeout: Application.get_env(:kafkaesque_core, :batch_timeout, 5000),
          min_demand: Application.get_env(:kafkaesque_core, :min_demand, 5),
          max_demand: Application.get_env(:kafkaesque_core, :max_batch_size, 500)
        ]},
@@ -290,6 +290,7 @@ defmodule Kafkaesque.Topic.LogReader do
 
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Telemetry
+  alias Kafkaesque.Utils.Retry
 
   defstruct [
     :topic,
@@ -370,6 +371,10 @@ defmodule Kafkaesque.Topic.LogReader do
           {:ok, records} ->
             GenServer.reply(from, {:ok, records})
 
+          {:error, :offset_out_of_range} ->
+            # Offset is beyond current data, return empty list
+            GenServer.reply(from, {:ok, []})
+
           {:error, reason} ->
             GenServer.reply(from, {:error, reason})
         end
@@ -407,7 +412,16 @@ defmodule Kafkaesque.Topic.LogReader do
   defp try_read(topic, partition, offset, max_bytes) do
     start_time = System.monotonic_time()
 
-    result = SingleFile.read(topic, partition, offset, max_bytes)
+    # Use retry logic for transient storage failures
+    result =
+      Retry.retry_with_backoff(
+        fn ->
+          SingleFile.read(topic, partition, offset, max_bytes)
+        end,
+        max_retries: 2,
+        initial_delay: 50,
+        retry_on: [:enoent, :eagain, :timeout]
+      )
 
     # Emit telemetry
     duration_ms =
@@ -435,11 +449,11 @@ defmodule Kafkaesque.Topic.LogReader do
           })
         end)
 
-      _ ->
-        :ok
-    end
+        {:ok, records}
 
-    result
+      error ->
+        error
+    end
   end
 end
 
@@ -506,8 +520,8 @@ defmodule Kafkaesque.Offsets.DetsOffset do
     result =
       case :dets.lookup(state.table_name, key) do
         [{^key, offset}] -> {:ok, offset}
-        # Start from beginning
-        [] -> {:ok, 0}
+        # No committed offset for this group
+        [] -> {:error, :not_found}
       end
 
     {:reply, result, state}

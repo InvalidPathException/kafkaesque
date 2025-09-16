@@ -7,6 +7,7 @@ defmodule Kafkaesque.Pipeline.Producer do
   use GenStage
   require Logger
 
+  alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Telemetry
 
   defstruct [
@@ -15,7 +16,8 @@ defmodule Kafkaesque.Pipeline.Producer do
     :queue,
     :demand,
     :max_queue_size,
-    :dropped_messages
+    :dropped_messages,
+    :pending_acks
   ]
 
   @max_queue_size Application.compile_env(
@@ -40,22 +42,12 @@ defmodule Kafkaesque.Pipeline.Producer do
     timeout = Keyword.get(opts, :timeout, 5000)
 
     case GenStage.call(via_tuple(topic, partition), {:produce, messages, acks}, timeout) do
-      {:ok, :enqueued} when acks == :none ->
-        {:ok,
-         %{
-           topic: topic,
-           partition: partition,
-           count: length(messages)
-         }}
+      {:ok, result} when acks == :none ->
+        # For acks=none, don't include base_offset
+        {:ok, Map.delete(result, :base_offset)}
 
-      {:ok, :enqueued} ->
-        {:ok,
-         %{
-           topic: topic,
-           partition: partition,
-           count: length(messages),
-           base_offset: 0
-         }}
+      {:ok, result} ->
+        {:ok, result}
 
       error ->
         error
@@ -83,7 +75,8 @@ defmodule Kafkaesque.Pipeline.Producer do
       queue: :queue.new(),
       demand: 0,
       max_queue_size: max_queue_size,
-      dropped_messages: 0
+      dropped_messages: 0,
+      pending_acks: %{}
     }
 
     Logger.info(
@@ -94,7 +87,7 @@ defmodule Kafkaesque.Pipeline.Producer do
   end
 
   @impl true
-  def handle_call({:produce, messages, _acks}, _from, state) do
+  def handle_call({:produce, messages, acks}, from, state) do
     current_size = :queue.len(state.queue)
     new_size = current_size + length(messages)
 
@@ -109,6 +102,9 @@ defmodule Kafkaesque.Pipeline.Producer do
       new_state = %{state | dropped_messages: state.dropped_messages + length(messages)}
       {:reply, {:error, :backpressure}, [], new_state}
     else
+      # Generate a request ID for tracking
+      request_id = :erlang.unique_integer([:positive])
+
       # Add messages to queue with metadata
       timestamped_messages =
         Enum.map(messages, fn msg ->
@@ -116,7 +112,8 @@ defmodule Kafkaesque.Pipeline.Producer do
             topic: msg[:topic] || state.topic,
             partition: msg[:partition] || state.partition,
             timestamp_ms: msg[:timestamp_ms] || System.system_time(:millisecond),
-            producer_timestamp: System.monotonic_time(:microsecond)
+            producer_timestamp: System.monotonic_time(:microsecond),
+            request_id: request_id
           })
         end)
 
@@ -136,13 +133,41 @@ defmodule Kafkaesque.Pipeline.Producer do
       {events, updated_queue, updated_demand} =
         dispatch_events(new_queue, state.demand, [])
 
+      # Store pending ack info if we need to wait for actual offset
+      new_pending_acks =
+        if acks != :none do
+          Map.put(state.pending_acks, request_id, %{
+            from: from,
+            acks: acks,
+            count: length(messages),
+            timestamp: System.monotonic_time(:millisecond)
+          })
+        else
+          state.pending_acks
+        end
+
       new_state = %{
         state
         | queue: updated_queue,
-          demand: updated_demand
+          demand: updated_demand,
+          pending_acks: new_pending_acks
       }
 
-      {:reply, {:ok, :enqueued}, events, new_state}
+      if acks == :none do
+        # For acks=none, reply immediately without offset
+        result = %{
+          topic: state.topic,
+          partition: state.partition,
+          count: length(messages)
+        }
+
+        {:reply, {:ok, result}, events, new_state}
+      else
+        # For acks=leader, we'll reply when we get confirmation
+        # Start a timer to check for write completion
+        Process.send_after(self(), {:check_write_completion, request_id}, 50)
+        {:noreply, events, new_state}
+      end
     end
   end
 
@@ -194,6 +219,52 @@ defmodule Kafkaesque.Pipeline.Producer do
   end
 
   @impl true
+  def handle_info({:check_write_completion, request_id}, state) do
+    case Map.get(state.pending_acks, request_id) do
+      nil ->
+        # Already handled
+        {:noreply, [], state}
+
+      %{from: from, count: count, timestamp: start_time} ->
+        # Check if messages were written by examining storage offsets
+        case SingleFile.get_offsets(state.topic, state.partition) do
+          {:ok, %{latest: latest, earliest: _earliest}} ->
+            # Calculate base offset (assuming messages were written sequentially)
+            base_offset = max(0, latest - count + 1)
+
+            # Reply with actual offsets
+            result = %{
+              topic: state.topic,
+              partition: state.partition,
+              count: count,
+              base_offset: base_offset
+            }
+
+            GenStage.reply(from, {:ok, result})
+
+            # Remove from pending acks
+            new_pending_acks = Map.delete(state.pending_acks, request_id)
+            {:noreply, [], %{state | pending_acks: new_pending_acks}}
+
+          _ ->
+            # Storage not ready yet or error, check again
+            elapsed = System.monotonic_time(:millisecond) - start_time
+
+            if elapsed > 5000 do
+              # Timeout - reply with error
+              GenStage.reply(from, {:error, :write_timeout})
+              new_pending_acks = Map.delete(state.pending_acks, request_id)
+              {:noreply, [], %{state | pending_acks: new_pending_acks}}
+            else
+              # Try again after a delay
+              Process.send_after(self(), {:check_write_completion, request_id}, 100)
+              {:noreply, [], state}
+            end
+        end
+    end
+  end
+
+  @impl true
   def handle_info({:telemetry, event}, state) do
     # Handle telemetry events if needed
     Logger.debug("Producer received telemetry event: #{inspect(event)}")
@@ -230,7 +301,8 @@ defmodule Kafkaesque.Pipeline.Producer do
   def format_status(:normal, [_pdict, state]) do
     [
       data: [
-        {"State", %{state | queue: :queue.len(state.queue)}}
+        {"State",
+         %{state | queue: :queue.len(state.queue), pending_acks: map_size(state.pending_acks)}}
       ]
     ]
   end

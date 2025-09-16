@@ -1,5 +1,5 @@
 defmodule Kafkaesque.Storage.IndexTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Kafkaesque.Storage.Index
 
@@ -48,29 +48,33 @@ defmodule Kafkaesque.Storage.IndexTest do
     end
 
     test "finds exact match", %{index: index} do
-      assert {:ok, 0} = Index.lookup(index, 0)
-      assert {:ok, 1000} = Index.lookup(index, 10)
-      assert {:ok, 2000} = Index.lookup(index, 20)
-      assert {:ok, 3000} = Index.lookup(index, 30)
+      assert {:ok, {0, 0}} = Index.lookup(index, 0)
+      assert {:ok, {1000, 10}} = Index.lookup(index, 10)
+      assert {:ok, {2000, 20}} = Index.lookup(index, 20)
+      assert {:ok, {3000, 30}} = Index.lookup(index, 30)
     end
 
     test "finds closest entry before offset", %{index: index} do
       # Offset 15 should find entry at offset 10
-      assert {:ok, position} = Index.lookup(index, 15)
-      # Should be at or after position 1000
-      assert position >= 1000
+      assert {:ok, {position, offset}} = Index.lookup(index, 15)
+      # Should be at position 1000 with offset 10
+      assert position == 1000
+      assert offset == 10
 
       # Offset 25 should find entry at offset 20
-      assert {:ok, position} = Index.lookup(index, 25)
-      assert position >= 2000
+      assert {:ok, {position, offset}} = Index.lookup(index, 25)
+      assert position == 2000
+      assert offset == 20
     end
 
     test "returns not_found for offset before min", %{index: index} do
       assert :not_found = Index.lookup(index, -1)
     end
 
-    test "returns not_found for offset after max", %{index: index} do
-      assert :not_found = Index.lookup(index, 100)
+    test "returns closest entry for offset after max", %{index: index} do
+      # Index returns the closest entry before the requested offset
+      # SingleFile handles checking if offset is actually out of range
+      assert {:ok, {3000, _length}} = Index.lookup(index, 100)
     end
 
     test "handles empty index" do
@@ -146,9 +150,9 @@ defmodule Kafkaesque.Storage.IndexTest do
       rebuilt = Index.rebuild(index, entries)
 
       assert Index.size(rebuilt) == 3
-      assert {:ok, 0} = Index.lookup(rebuilt, 0)
-      assert {:ok, 1000} = Index.lookup(rebuilt, 10)
-      assert {:ok, 2000} = Index.lookup(rebuilt, 20)
+      assert {:ok, {0, 0}} = Index.lookup(rebuilt, 0)
+      assert {:ok, {1000, 10}} = Index.lookup(rebuilt, 10)
+      assert {:ok, {2000, 20}} = Index.lookup(rebuilt, 20)
     end
   end
 
@@ -187,8 +191,8 @@ defmodule Kafkaesque.Storage.IndexTest do
       assert Index.size(compacted) == 2
       assert :not_found = Index.lookup(compacted, 0)
       assert :not_found = Index.lookup(compacted, 10)
-      assert {:ok, 2000} = Index.lookup(compacted, 20)
-      assert {:ok, 3000} = Index.lookup(compacted, 30)
+      assert {:ok, {2000, 20}} = Index.lookup(compacted, 20)
+      assert {:ok, {3000, 30}} = Index.lookup(compacted, 30)
       assert compacted.min_offset == 20
     end
   end

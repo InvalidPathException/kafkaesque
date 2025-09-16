@@ -58,6 +58,13 @@ defmodule Kafkaesque.TestCase do
       topics = Kafkaesque.Topic.Supervisor.list_topics()
 
       Enum.each(topics, fn topic ->
+        # Force flush any pending batches before deletion
+        try do
+          flush_topic_batches(topic.name)
+        catch
+          _kind, _reason -> :ok
+        end
+
         Kafkaesque.Topic.Supervisor.delete_topic(topic.name)
       end)
 
@@ -72,11 +79,45 @@ defmodule Kafkaesque.TestCase do
       # Wait until Registry is clean
       wait_for_clean_registry(deadline)
 
+      # Clean up any orphaned processes
+      kill_orphaned_processes()
+
       # Small final delay to ensure everything settles
       Process.sleep(50)
     end
 
     :ok
+  end
+
+  defp flush_topic_batches(topic_name) do
+    # Try to flush batches for all partitions
+    case Kafkaesque.Topic.Supervisor.get_topic_info(topic_name) do
+      {:ok, topic_info} ->
+        Enum.each(0..(topic_info.partitions - 1), fn partition ->
+          # Send a flush signal to the batching consumer
+          case Registry.lookup(Kafkaesque.TopicRegistry, {:batching_consumer, topic_name, partition}) do
+            [{pid, _}] when is_pid(pid) ->
+              try do
+                GenServer.call(pid, :flush_batch, 500)
+              catch
+                :exit, _ -> :ok
+              end
+            _ -> :ok
+          end
+        end)
+      _ ->
+        :ok
+    end
+  end
+
+  defp kill_orphaned_processes do
+    # Kill any lingering topic-related processes
+    Registry.select(Kafkaesque.TopicRegistry, [{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2"}}]}])
+    |> Enum.each(fn {_key, pid} ->
+      if is_pid(pid) and Process.alive?(pid) do
+        Process.exit(pid, :kill)
+      end
+    end)
   end
 
   defp wait_for_clean_topics(deadline) do

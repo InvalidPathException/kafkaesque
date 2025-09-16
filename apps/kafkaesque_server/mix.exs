@@ -40,7 +40,8 @@ defmodule KafkaesqueServer.MixProject do
       {:cors_plug, "~> 3.0"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.2"},
-      {:telemetry_metrics, "~> 1.0"}
+      {:telemetry_metrics, "~> 1.0"},
+      {:meck, "~> 0.9", only: :test}
     ]
   end
 

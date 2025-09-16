@@ -8,6 +8,7 @@ defmodule Kafkaesque.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       listeners: [Phoenix.CodeReloader],
+      elixirc_paths: elixirc_paths(Mix.env()),
       releases: [
         kafkaesque: [
           applications: [
@@ -20,6 +21,9 @@ defmodule Kafkaesque.MixProject do
       aliases: aliases()
     ]
   end
+
+  defp elixirc_paths(:test), do: ["test/support"]
+  defp elixirc_paths(_), do: []
 
   defp deps do
     [

@@ -5,6 +5,8 @@ defmodule Kafkaesque.Pipeline.BatchingTest do
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
 
+  import Kafkaesque.TestHelpers, only: [wait_for_messages: 4]
+
   setup do
     # Ensure clean state before test
     ensure_clean_state()
@@ -51,9 +53,8 @@ defmodule Kafkaesque.Pipeline.BatchingTest do
 
       {:ok, _} = Producer.produce(test_topic, test_partition, messages)
 
-      # Wait for the full batch timeout to ensure messages are written
-      batch_timeout = Application.get_env(:kafkaesque_core, :batch_timeout, 5) * 1000
-      Process.sleep(batch_timeout + 1000)
+      # Wait for messages to be written (timeout-based batch)
+      assert :ok = wait_for_messages(test_topic, test_partition, 3, 2000)
 
       # Now messages should be written
       {:ok, after_timeout} = SingleFile.read(test_topic, test_partition, 0, 10_000)
@@ -83,8 +84,8 @@ defmodule Kafkaesque.Pipeline.BatchingTest do
 
       {:ok, _} = Producer.produce(test_topic, test_partition, messages)
 
-      # Full batch should trigger immediate write, but wait for processing
-      Process.sleep(2000)
+      # Full batch should trigger immediate write
+      assert :ok = wait_for_messages(test_topic, test_partition, batch_size, 2000)
 
       {:ok, stored} = SingleFile.read(test_topic, test_partition, 0, 100_000)
 
@@ -107,9 +108,8 @@ defmodule Kafkaesque.Pipeline.BatchingTest do
 
       {:ok, _} = Producer.produce(test_topic, test_partition, messages)
 
-      # Wait for both batches to be written
-      batch_timeout = Application.get_env(:kafkaesque_core, :batch_timeout, 5) * 1000
-      Process.sleep(batch_timeout + 2000)
+      # Wait for all messages to be written (might be multiple batches)
+      assert :ok = wait_for_messages(test_topic, test_partition, total_messages, 5000)
 
       {:ok, stored} = SingleFile.read(test_topic, test_partition, 0, 100_000)
 
@@ -131,9 +131,8 @@ defmodule Kafkaesque.Pipeline.BatchingTest do
 
       {:ok, _} = Producer.produce(test_topic, test_partition, messages)
 
-      # Wait for batch timeout to ensure all messages are written
-      batch_timeout = Application.get_env(:kafkaesque_core, :batch_timeout, 5) * 1000
-      Process.sleep(batch_timeout + 1000)
+      # Wait for messages to be written
+      assert :ok = wait_for_messages(test_topic, test_partition, 20, 2000)
 
       {:ok, stored} = SingleFile.read(test_topic, test_partition, 0, 10_000)
 
@@ -175,8 +174,8 @@ defmodule Kafkaesque.Pipeline.BatchingTest do
         assert {:ok, _} = result
       end)
 
-      # Wait for batching
-      Process.sleep(6000)
+      # Wait for all messages from concurrent producers
+      assert :ok = wait_for_messages(test_topic, test_partition, 50, 5000)
 
       # Read all messages
       {:ok, stored} = SingleFile.read(test_topic, test_partition, 0, 100_000)

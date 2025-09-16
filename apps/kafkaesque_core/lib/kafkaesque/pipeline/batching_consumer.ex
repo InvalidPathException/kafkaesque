@@ -20,9 +20,6 @@ defmodule Kafkaesque.Pipeline.BatchingConsumer do
     :last_batch_time
   ]
 
-  @default_batch_size Application.compile_env(:kafkaesque_core, :max_batch_size, 500)
-  @default_batch_timeout Application.compile_env(:kafkaesque_core, :batch_timeout, 5) * 1000
-
   def start_link(opts) do
     topic = Keyword.fetch!(opts, :topic)
     partition = Keyword.fetch!(opts, :partition)
@@ -34,16 +31,14 @@ defmodule Kafkaesque.Pipeline.BatchingConsumer do
   def init(opts) do
     topic = Keyword.fetch!(opts, :topic)
     partition = Keyword.fetch!(opts, :partition)
-    batch_size = Keyword.get(opts, :batch_size, @default_batch_size)
-    # Convert batch_timeout to milliseconds if provided in seconds
-    batch_timeout =
-      case Keyword.get(opts, :batch_timeout) do
-        nil -> @default_batch_timeout
-        # Assume seconds if < 100
-        timeout when timeout < 100 -> timeout * 1000
-        # Already in milliseconds
-        timeout -> timeout
-      end
+
+    # Get configuration from runtime environment (allows test overrides)
+    default_batch_size = Application.get_env(:kafkaesque_core, :batch_size, 500)
+    default_batch_timeout = Application.get_env(:kafkaesque_core, :batch_timeout, 5000)
+
+    batch_size = Keyword.get(opts, :batch_size, default_batch_size)
+    # Get batch timeout, already in milliseconds from config
+    batch_timeout = Keyword.get(opts, :batch_timeout, default_batch_timeout)
 
     state = %__MODULE__{
       topic: topic,
@@ -135,6 +130,28 @@ defmodule Kafkaesque.Pipeline.BatchingConsumer do
        }}
     else
       {:noreply, [], %{state | batch_timer: nil}}
+    end
+  end
+
+  @impl true
+  def handle_call(:flush_batch, _from, state) do
+    if length(state.batch) > 0 do
+      write_batch(state, state.batch)
+
+      # Cancel any pending timer
+      if state.batch_timer do
+        Process.cancel_timer(state.batch_timer)
+      end
+
+      {:reply, :ok, [],
+       %{
+         state
+         | batch: [],
+           batch_timer: nil,
+           last_batch_time: System.monotonic_time(:millisecond)
+       }}
+    else
+      {:reply, :ok, [], state}
     end
   end
 

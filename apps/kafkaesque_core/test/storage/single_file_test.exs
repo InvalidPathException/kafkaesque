@@ -155,6 +155,29 @@ defmodule Kafkaesque.Storage.SingleFileTest do
       assert List.first(records).value == "test_value_1"
     end
 
+    test "reads from non-indexed offset correctly" do
+      # Add 20 records to ensure we have offsets beyond the index interval
+      records = create_test_records(20, "offset_test")
+      {:ok, _} = SingleFile.append(@test_topic, @test_partition, records)
+
+      # Give time for write to complete
+      Process.sleep(100)
+
+      # Read from offset 5 (not in index since interval is 10)
+      assert {:ok, read_records} = SingleFile.read(@test_topic, @test_partition, 5, 10_000)
+      assert length(read_records) > 0
+
+      # First record should be from offset 5 (the original 5 + new 20 = offset 5 should be record 1)
+      # But since we already had 5 records, offset 5 is the 6th record overall
+      # Actually, let's check the offset field
+      first = List.first(read_records)
+      assert first.offset == 5
+
+      # Read from offset 15 (also not in index)
+      assert {:ok, records_15} = SingleFile.read(@test_topic, @test_partition, 15, 10_000)
+      assert List.first(records_15).offset == 15
+    end
+
     test "reads with max_bytes limit" do
       # Read with very small limit
       assert {:ok, records} = SingleFile.read(@test_topic, @test_partition, 0, 100)

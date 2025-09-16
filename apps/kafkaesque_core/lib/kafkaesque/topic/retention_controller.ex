@@ -238,7 +238,7 @@ defmodule Kafkaesque.Topic.RetentionController do
           {:ok, %{latest: latest_offset}} when latest_offset > 0 ->
             # Binary search through offsets to find retention point
             # For now, estimate based on time proportion
-            # In production, would scan actual message timestamps
+            # TODO: might scan actual message timestamps
             current_time = System.system_time(:millisecond)
             time_range = current_time - cutoff_time
 
