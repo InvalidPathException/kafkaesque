@@ -228,58 +228,179 @@ defmodule Kafkaesque.Topic.RetentionController do
   end
 
   defp find_offset_after_timestamp(state, cutoff_time) do
-    # Get the storage and index to find the first offset after cutoff_time
-    case Registry.lookup(
-           Kafkaesque.TopicRegistry,
-           {:storage, state.topic, state.partition}
-         ) do
-      [{pid, _}] when is_pid(pid) ->
-        case SingleFile.get_offsets(state.topic, state.partition) do
-          {:ok, %{latest: latest_offset}} when latest_offset > 0 ->
-            # Binary search through offsets to find retention point
-            # For now, estimate based on time proportion
-            # TODO: might scan actual message timestamps
-            current_time = System.system_time(:millisecond)
-            time_range = current_time - cutoff_time
-
-            if time_range > 0 and state.retention_ms > 0 do
-              # Estimate offset based on time proportion
-              retention_ratio = min(1.0, time_range / state.retention_ms)
-              round(latest_offset * (1 - retention_ratio))
-            else
-              0
-            end
-
-          _ ->
-            0
-        end
+    # Get offsets range first
+    case SingleFile.get_offsets(state.topic, state.partition) do
+      {:ok, %{earliest: earliest, latest: latest}} when latest > earliest ->
+        # Use binary search to find the first offset after cutoff time
+        binary_search_timestamp(state.topic, state.partition, earliest, latest, cutoff_time)
 
       _ ->
+        # No messages or error
         0
+    end
+  end
+
+  defp binary_search_timestamp(topic, partition, low, high, cutoff_time) do
+    # Binary search for the first message with timestamp >= cutoff_time
+    binary_search_timestamp_impl(topic, partition, low, high, cutoff_time, nil)
+  end
+
+  defp binary_search_timestamp_impl(topic, partition, low, high, cutoff_time, best_found) do
+    if low > high do
+      # Search complete, return the best offset found
+      best_found || 0
+    else
+      mid = div(low + high, 2)
+
+      # Read a single message at the midpoint
+      case SingleFile.read(topic, partition, mid, 1) do
+        {:ok, [message]} ->
+          message_time = message[:timestamp_ms] || 0
+
+          if message_time >= cutoff_time do
+            # This message is after cutoff, search earlier for a better match
+            new_best = mid
+            binary_search_timestamp_impl(topic, partition, low, mid - 1, cutoff_time, new_best)
+          else
+            # This message is before cutoff, search later
+            binary_search_timestamp_impl(topic, partition, mid + 1, high, cutoff_time, best_found)
+          end
+
+        {:ok, []} ->
+          # No message at this offset, try earlier
+          binary_search_timestamp_impl(topic, partition, low, mid - 1, cutoff_time, best_found)
+
+        _ ->
+          # Error reading, try different range
+          if mid > low do
+            binary_search_timestamp_impl(topic, partition, low, mid - 1, cutoff_time, best_found)
+          else
+            best_found || 0
+          end
+      end
     end
   end
 
   defp find_offset_for_size_limit(state, size_limit_bytes) do
-    # Mock implementation - in reality would calculate cumulative size
-    # Returns an offset that keeps total size under the limit
-
-    file_path = Path.join([state.storage_path, state.topic, "#{state.partition}.log"])
+    # Calculate cumulative size and find offset where we exceed retention
+    file_path = Path.join([state.storage_path, state.topic, "p-#{state.partition}.log"])
 
     case File.stat(file_path) do
       {:ok, %{size: file_size}} when file_size > size_limit_bytes ->
-        # Calculate approximate offset based on file size
-        # This is very simplified - real implementation would be precise
-        retention_ratio = size_limit_bytes / file_size
-        estimated_offset = round(1000 * (1 - retention_ratio))
-        max(0, estimated_offset)
+        # We need to keep only size_limit_bytes, so calculate how much to remove
+        bytes_to_remove = file_size - size_limit_bytes
+
+        # Scan through messages to find where we've accumulated enough bytes to remove
+        find_size_based_offset(state.topic, state.partition, bytes_to_remove)
+
+      _ ->
+        # File is smaller than limit, keep everything
+        0
+    end
+  end
+
+  defp find_size_based_offset(topic, partition, bytes_to_remove) do
+    case SingleFile.get_offsets(topic, partition) do
+      {:ok, %{earliest: earliest, latest: latest}} when latest > earliest ->
+        scan_for_size_limit_recursive(topic, partition, earliest, latest, bytes_to_remove, 0)
 
       _ ->
         0
     end
   end
 
+  defp scan_for_size_limit_recursive(
+         topic,
+         partition,
+         current_offset,
+         end_offset,
+         bytes_to_remove,
+         accumulated
+       ) do
+    if current_offset > end_offset or accumulated >= bytes_to_remove do
+      # We've accumulated enough bytes to remove, return this offset as the new watermark
+      current_offset
+    else
+      batch_size = min(50, end_offset - current_offset + 1)
+
+      case SingleFile.read(topic, partition, current_offset, batch_size * 100) do
+        {:ok, messages} when messages != [] ->
+          # Calculate size of these messages
+          batch_bytes = calculate_messages_size(messages)
+          new_accumulated = accumulated + batch_bytes
+          messages_count = length(messages)
+          next_offset = current_offset + messages_count
+
+          if new_accumulated >= bytes_to_remove do
+            # Found the cutoff point - scan within this batch for exact offset
+            find_exact_size_cutoff(messages, current_offset, bytes_to_remove, accumulated)
+          else
+            # Continue scanning
+            scan_for_size_limit_recursive(
+              topic,
+              partition,
+              next_offset,
+              end_offset,
+              bytes_to_remove,
+              new_accumulated
+            )
+          end
+
+        _ ->
+          # No more messages or error, return current offset
+          current_offset
+      end
+    end
+  end
+
+  defp find_exact_size_cutoff(messages, base_offset, bytes_to_remove, accumulated_before) do
+    # Find the exact message where we cross the threshold
+    {offset, _} =
+      Enum.reduce_while(messages, {base_offset, accumulated_before}, fn msg, {offset, acc} ->
+        msg_size = calculate_message_size(msg)
+        new_acc = acc + msg_size
+
+        if new_acc >= bytes_to_remove do
+          {:halt, {offset + 1, new_acc}}
+        else
+          {:cont, {offset + 1, new_acc}}
+        end
+      end)
+
+    offset
+  end
+
+  defp calculate_message_size(msg) do
+    key_size = byte_size(msg[:key] || <<>>)
+    value_size = byte_size(msg[:value] || <<>>)
+    headers_size = calculate_headers_size(msg[:headers] || [])
+
+    # Frame overhead: 4 (length) + 1 (magic) + 1 (attr) + 8 (timestamp) + 4 (key_len) + 4 (val_len) + 2 (headers_len)
+    frame_overhead = 24
+    key_size + value_size + headers_size + frame_overhead
+  end
+
+  defp calculate_messages_size(messages) do
+    Enum.reduce(messages, 0, fn msg, acc ->
+      key_size = byte_size(msg[:key] || <<>>)
+      value_size = byte_size(msg[:value] || <<>>)
+      headers_size = calculate_headers_size(msg[:headers] || [])
+
+      # Frame overhead: 4 (length) + 1 (magic) + 1 (attr) + 8 (timestamp) + 4 (key_len) + 4 (val_len) + 2 (headers_len)
+      frame_overhead = 24
+      acc + key_size + value_size + headers_size + frame_overhead
+    end)
+  end
+
+  defp calculate_headers_size(headers) do
+    Enum.reduce(headers, 0, fn {k, v}, acc ->
+      # Each header has: 2 (key_len) + key + 2 (val_len) + value
+      acc + 4 + byte_size(to_string(k)) + byte_size(to_string(v))
+    end)
+  end
+
   defp calculate_retention_stats(state) do
-    # Get real statistics from storage
+    # Get statistics from storage
     stats =
       case Registry.lookup(
              Kafkaesque.TopicRegistry,

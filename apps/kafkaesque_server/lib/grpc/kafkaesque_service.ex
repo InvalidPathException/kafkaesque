@@ -261,8 +261,8 @@ defmodule Kafkaesque.GRPC.Service do
         start_time: System.monotonic_time(:millisecond),
         messages_sent: 0,
         last_heartbeat: System.monotonic_time(:millisecond),
-        # 5 minutes max stream duration
-        max_duration_ms: 300_000
+        # Configurable max stream duration (default 5 minutes)
+        max_duration_ms: Application.get_env(:kafkaesque_server, :max_stream_duration_ms, 300_000)
       }
     )
   end
@@ -406,9 +406,19 @@ defmodule Kafkaesque.GRPC.Service do
   end
 
   defp stream_healthy?(stream) do
-    # Check if the stream process is still alive
-    # TODO: might want more sophisticated health checks
-    Process.alive?(stream.adapter_payload.pid)
+    # Check if the stream process is still alive and not overloaded
+    pid = stream.adapter_payload.pid
+
+    if Process.alive?(pid) do
+      # Check message queue length to detect overload
+      case Process.info(pid, :message_queue_len) do
+        {:message_queue_len, len} -> len < 1000
+        # Process.info returns nil if process doesn't exist
+        nil -> true
+      end
+    else
+      false
+    end
   rescue
     # If we can't check, assume it's healthy
     _ -> true

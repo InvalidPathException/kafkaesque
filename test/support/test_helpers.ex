@@ -4,7 +4,6 @@ defmodule Kafkaesque.Test.Helpers do
   """
 
   import ExUnit.Assertions
-  alias Kafkaesque.Offsets.DetsOffset
   alias Kafkaesque.Pipeline.Producer
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Test.{Config, Factory}

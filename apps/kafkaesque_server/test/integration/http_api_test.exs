@@ -1,8 +1,21 @@
 defmodule KafkaesqueServer.Integration.HttpApiTest do
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias Kafkaesque.Offsets.DetsOffset
   alias Kafkaesque.Test.{Client, Factory, Helpers}
+  alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
+
+  setup_all do
+    # Clean up all topics before running integration tests
+    if Process.whereis(TopicSupervisor) do
+      topics = TopicSupervisor.list_topics()
+      Enum.each(topics, fn topic ->
+        TopicSupervisor.delete_topic(topic.name)
+      end)
+    end
+    :ok
+  end
 
   setup do
     # Set up isolated test environment

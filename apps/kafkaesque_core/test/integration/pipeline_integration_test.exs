@@ -1,11 +1,23 @@
 defmodule Kafkaesque.Pipeline.IntegrationTest do
   use Kafkaesque.TestCase, async: false
+  @moduletag :integration
 
   alias Kafkaesque.Pipeline.Producer
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
 
   import Kafkaesque.TestHelpers, only: [wait_for_messages: 4]
+
+  setup_all do
+    # Clean up all topics before running integration tests
+    if Process.whereis(TopicSupervisor) do
+      topics = TopicSupervisor.list_topics()
+      Enum.each(topics, fn topic ->
+        TopicSupervisor.delete_topic(topic.name)
+      end)
+    end
+    :ok
+  end
 
   setup do
     # Ensure clean state before test

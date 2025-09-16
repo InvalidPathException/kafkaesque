@@ -1,11 +1,13 @@
 defmodule Kafkaesque.Integration.GRPCServiceTest do
   use ExUnit.Case, async: false
+  @moduletag :integration
 
   alias Kafkaesque.GRPC.Service
   alias Kafkaesque.Offsets.DetsOffset
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Test.{Factory, Helpers}
   alias Kafkaesque.Topic.LogReader
+  alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
   alias Kafkaesque.{
     CommitOffsetsRequest,
     CommitOffsetsResponse,
@@ -19,6 +21,17 @@ defmodule Kafkaesque.Integration.GRPCServiceTest do
     RecordHeader,
     Topic
   }
+
+  setup_all do
+    # Clean up all topics before running integration tests
+    if Process.whereis(TopicSupervisor) do
+      topics = TopicSupervisor.list_topics()
+      Enum.each(topics, fn topic ->
+        TopicSupervisor.delete_topic(topic.name)
+      end)
+    end
+    :ok
+  end
 
   setup do
     # Set up isolated test environment

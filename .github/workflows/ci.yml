@@ -64,8 +64,11 @@ jobs:
     - name: Check compilation warnings
       run: mix compile --warnings-as-errors
     
-    - name: Run tests
-      run: mix cmd mix test
+    - name: Run unit tests
+      run: mix cmd mix test --exclude integration
+
+    - name: Run integration tests
+      run: mix cmd mix test --only integration
     
     - name: Check for unused dependencies
       run: mix deps.unlock --check-unused

@@ -1,5 +1,6 @@
 defmodule Kafkaesque.Integration.TopicLifecycleTest do
   use ExUnit.Case, async: false
+  @moduletag :integration
   import Kafkaesque.TestHelpers
 
   alias Kafkaesque.GRPC.Service
@@ -7,8 +8,17 @@ defmodule Kafkaesque.Integration.TopicLifecycleTest do
   alias Kafkaesque.Pipeline.Producer
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Topic.LogReader
+  alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
 
   setup_all do
+    # Clean up all topics before running integration tests
+    if Process.whereis(TopicSupervisor) do
+      topics = TopicSupervisor.list_topics()
+      Enum.each(topics, fn topic ->
+        TopicSupervisor.delete_topic(topic.name)
+      end)
+    end
+
     # Ensure servers are started for integration tests
     KafkaesqueServer.TestSetup.setup_integration_test()
 

@@ -3,6 +3,10 @@ defmodule KafkaesqueDashboard.DashboardLive do
   import KafkaesqueDashboard.CoreComponents
   import LiveSvelte
 
+  alias Kafkaesque.Storage.SingleFile
+  alias Kafkaesque.Telemetry
+  alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
+
   # Subscribe to telemetry events
   @telemetry_events [
     [:kafkaesque, :message, :produced],
@@ -128,74 +132,350 @@ defmodule KafkaesqueDashboard.DashboardLive do
     {uptime_seconds, _} = :erlang.statistics(:wall_clock)
     memory = :erlang.memory()
 
+    # Get CPU usage (if available)
+    cpu_usage =
+      try do
+        cpu_util = :cpu_sup.util()
+
+        if is_number(cpu_util) do
+          min(round(cpu_util), 100)
+        else
+          get_scheduler_usage()
+        end
+      rescue
+        _ -> get_scheduler_usage()
+      end
+
+    # Get disk usage from data directory
+    data_dir = Application.get_env(:kafkaesque_core, :data_dir, "./data")
+    disk_stats = get_disk_usage(data_dir)
+
     %{
       uptime_hours: div(uptime_seconds, 3_600_000),
       memory_usage_mb: div(memory[:total], 1024 * 1024),
-      memory_max_mb: 4096,
-      cpu_usage: 35 + :rand.uniform(30),
+      memory_max_mb: div(memory[:system], 1024 * 1024),
+      cpu_usage: cpu_usage,
       cpu_max: 100,
       beam_processes: :erlang.system_info(:process_count),
-      disk_usage_gb: 2.4 + :rand.uniform() * 0.5,
-      disk_max_gb: 10.0,
-      network_in_mbps: 10 + :rand.uniform(20),
-      network_out_mbps: 15 + :rand.uniform(25)
+      disk_usage_gb: disk_stats.used_gb,
+      disk_max_gb: disk_stats.total_gb,
+      network_in_mbps: get_network_stats(:input),
+      network_out_mbps: get_network_stats(:output)
     }
+  end
+
+  defp get_scheduler_usage do
+    # Fallback: estimate CPU from scheduler utilization
+    schedulers = :erlang.system_info(:schedulers_online)
+
+    try do
+      util = :scheduler.utilization(1)
+
+      if is_list(util) do
+        # Calculate average utilization from scheduler list
+        total_util =
+          Enum.reduce(util, 0.0, fn
+            {:normal, _id, usage, _desc}, acc -> acc + usage
+            {:cpu, _id, usage, _desc}, acc -> acc + usage
+            {:io, _id, usage, _desc}, acc -> acc + usage
+            {_type, usage, _desc}, acc -> acc + usage
+            _, acc -> acc
+          end)
+
+        avg = total_util / schedulers
+        round(avg * 100)
+      else
+        # Last resort: check run queue length
+        run_queue = :erlang.statistics(:run_queue)
+        min(round(run_queue * 100 / schedulers), 100)
+      end
+    rescue
+      _ ->
+        # Last resort: check run queue length
+        run_queue = :erlang.statistics(:run_queue)
+        min(round(run_queue * 100 / schedulers), 100)
+    end
+  end
+
+  defp get_disk_usage(path) do
+    # Get actual disk usage for the data directory
+    case System.cmd("df", ["-k", path]) do
+      {output, 0} ->
+        # Parse df output
+        lines = String.split(output, "\n")
+
+        case Enum.at(lines, 1) do
+          nil ->
+            %{used_gb: 0.0, total_gb: 10.0}
+
+          line ->
+            parts = String.split(line, ~r/\s+/)
+
+            case parts do
+              [_filesystem, total_kb, used_kb | _] ->
+                %{
+                  used_gb: String.to_integer(used_kb) / (1024 * 1024),
+                  total_gb: String.to_integer(total_kb) / (1024 * 1024)
+                }
+
+              _ ->
+                %{used_gb: 0.0, total_gb: 10.0}
+            end
+        end
+
+      _ ->
+        # Fallback: calculate size of all files in data directory
+        used_bytes = calculate_directory_size(path)
+
+        %{
+          used_gb: used_bytes / (1024 * 1024 * 1024),
+          total_gb: 10.0
+        }
+    end
+  rescue
+    _ -> %{used_gb: 0.0, total_gb: 10.0}
+  end
+
+  defp calculate_directory_size(path) do
+    case File.ls(path) do
+      {:ok, files} ->
+        Enum.reduce(files, 0, fn file, acc ->
+          full_path = Path.join(path, file)
+
+          case File.stat(full_path) do
+            {:ok, %{size: size, type: :regular}} -> acc + size
+            {:ok, %{type: :directory}} -> acc + calculate_directory_size(full_path)
+            _ -> acc
+          end
+        end)
+
+      _ ->
+        0
+    end
+  end
+
+  defp get_network_stats(direction) do
+    # Get network stats from telemetry if available
+    case Kafkaesque.Telemetry.get_metrics() do
+      metrics when is_map(metrics) ->
+        case direction do
+          :input -> Map.get(metrics, :bytes_in_per_sec, 0) / (1024 * 1024)
+          :output -> Map.get(metrics, :bytes_out_per_sec, 0) / (1024 * 1024)
+        end
+
+      _ ->
+        0
+    end
+  rescue
+    _ -> 0
   end
 
   defp get_topic_stats do
+    topics = TopicSupervisor.list_topics()
+
+    # Calculate aggregated stats
+    {total_partitions, total_messages, total_bytes} =
+      Enum.reduce(topics, {0, 0, 0}, fn topic, {partitions_acc, messages_acc, bytes_acc} ->
+        partition_count = Map.get(topic, :partitions, 0)
+
+        # Get stats for each partition
+        {messages, bytes} = get_topic_partition_stats(topic.name, partition_count)
+
+        {partitions_acc + partition_count, messages_acc + messages, bytes_acc + bytes}
+      end)
+
+    # Get throughput from telemetry
+    telemetry_stats =
+      try do
+        Kafkaesque.Telemetry.get_metrics()
+      rescue
+        _ -> %{}
+      end
+
     %{
-      total_topics: 12,
-      total_partitions: 48,
-      total_messages: 15_234_567 + :rand.uniform(100_000),
-      storage_size_gb: 2.4 + :rand.uniform() * 0.2,
-      messages_per_sec: 1234 + :rand.uniform(500),
-      bytes_per_sec: 567_890 + :rand.uniform(100_000)
+      total_topics: length(topics),
+      total_partitions: total_partitions,
+      total_messages: total_messages,
+      storage_size_gb: total_bytes / (1024 * 1024 * 1024),
+      messages_per_sec: Map.get(telemetry_stats, :messages_per_sec, 0),
+      bytes_per_sec: Map.get(telemetry_stats, :bytes_per_sec, 0)
     }
   end
 
+  defp get_topic_partition_stats(topic_name, partition_count) do
+    Enum.reduce(0..(partition_count - 1), {0, 0}, fn partition, {msg_acc, bytes_acc} ->
+      case SingleFile.get_offsets(topic_name, partition) do
+        {:ok, %{latest: latest}} ->
+          # Get file size for this partition
+          data_dir = Application.get_env(:kafkaesque_core, :data_dir, "./data")
+          file_path = Path.join([data_dir, topic_name, "p-#{partition}.log"])
+
+          file_size =
+            case File.stat(file_path) do
+              {:ok, %{size: size}} -> size
+              _ -> 0
+            end
+
+          {msg_acc + latest + 1, bytes_acc + file_size}
+
+        _ ->
+          {msg_acc, bytes_acc}
+      end
+    end)
+  end
+
   defp get_topics do
-    [
-      %{name: "user-events", partitions: 8, messages: 5_234_567, size_mb: 1234},
-      %{name: "order-transactions", partitions: 12, messages: 3_456_789, size_mb: 2345},
-      %{name: "analytics-events", partitions: 4, messages: 2_345_678, size_mb: 567},
-      %{name: "system-logs", partitions: 6, messages: 1_234_567, size_mb: 890},
-      %{name: "user-profiles", partitions: 4, messages: 890_123, size_mb: 456},
-      %{name: "payment-events", partitions: 8, messages: 1_567_890, size_mb: 1234},
-      %{name: "inventory-updates", partitions: 6, messages: 678_901, size_mb: 345}
-    ]
+    topics = TopicSupervisor.list_topics()
+
+    Enum.map(topics, fn topic ->
+      # Get aggregated stats for all partitions
+      {total_messages, total_bytes} = get_topic_partition_stats(topic.name, topic.partitions)
+
+      %{
+        name: topic.name,
+        partitions: topic.partitions,
+        messages: total_messages,
+        size_mb: div(total_bytes, 1024 * 1024)
+      }
+    end)
   end
 
   defp get_consumer_groups do
-    [
-      %{name: "analytics-pipeline", lag: 1234 + :rand.uniform(500), members: 5, state: "stable"},
-      %{name: "event-processor", lag: 567 + :rand.uniform(200), members: 3, state: "stable"},
-      %{name: "backup-writer", lag: 4567 + :rand.uniform(1000), members: 1, state: "rebalancing"},
-      %{name: "stream-aggregator", lag: 890 + :rand.uniform(300), members: 2, state: "stable"},
-      %{name: "ml-pipeline", lag: 2345 + :rand.uniform(600), members: 4, state: "stable"},
-      %{name: "real-time-alerts", lag: 123 + :rand.uniform(100), members: 2, state: "stable"}
-    ]
+    # Get all consumer groups by scanning offset tables
+    offsets_dir = Application.get_env(:kafkaesque_core, :offsets_dir, "./offsets")
+
+    case File.ls(offsets_dir) do
+      {:ok, files} ->
+        # Parse DETS files to find unique consumer groups
+        groups =
+          files
+          |> Enum.filter(&String.ends_with?(&1, "_offsets.dets"))
+          |> Enum.flat_map(fn file ->
+            extract_consumer_groups_from_file(Path.join(offsets_dir, file))
+          end)
+          |> Enum.group_by(& &1.name)
+          |> Enum.map(fn {group_name, group_data} ->
+            # Aggregate data for each group
+            total_lag = Enum.reduce(group_data, 0, fn g, acc -> acc + g.lag end)
+
+            %{
+              name: group_name,
+              lag: total_lag,
+              # Approximate by partition count
+              members: length(group_data),
+              # Default state, could be enhanced with real tracking
+              state: "stable"
+            }
+          end)
+
+        if groups == [] do
+          # Return empty list if no consumer groups
+          []
+        else
+          groups
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp extract_consumer_groups_from_file(file_path) do
+    # Parse filename to get topic and partition
+    basename = Path.basename(file_path, "_offsets.dets")
+
+    case String.split(basename, "_") do
+      [topic | rest] when rest != [] ->
+        partition_str = List.last(rest)
+        partition = String.to_integer(partition_str || "0")
+        topic_name = Enum.join([topic | Enum.drop(rest, -1)], "_")
+
+        # Open DETS file to read consumer groups
+        table_name = String.to_atom("temp_#{:erlang.unique_integer([:positive])}")
+
+        case :dets.open_file(table_name, file: String.to_charlist(file_path), access: :read) do
+          {:ok, _} ->
+            groups = extract_groups_from_table(table_name, topic_name, partition)
+            :dets.close(table_name)
+            groups
+
+          _ ->
+            []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp extract_groups_from_table(table_name, topic, partition) do
+    # Read all entries from DETS table
+    case :dets.match_object(table_name, :_) do
+      entries when is_list(entries) ->
+        entries
+        |> Enum.map(fn
+          {{^topic, ^partition, group}, offset} ->
+            # Calculate lag by comparing with latest offset
+            latest = get_latest_offset(topic, partition)
+            lag = max(0, latest - offset)
+            %{name: group, lag: lag, topic: topic, partition: partition}
+
+          _ ->
+            nil
+        end)
+        |> Enum.reject(&is_nil/1)
+
+      _ ->
+        []
+    end
+  end
+
+  defp get_latest_offset(topic, partition) do
+    case SingleFile.get_offsets(topic, partition) do
+      {:ok, %{latest: latest}} -> latest
+      _ -> 0
+    end
   end
 
   defp get_throughput_data do
-    # Generate 30 data points for better visualization
-    # Keep consistent range between 500-2500 for stable scaling
-    for _ <- 0..29 do
-      base = 1200
-      # -300 to +300
-      variation = :rand.uniform(600) - 300
-      spike = if :rand.uniform(10) > 8, do: :rand.uniform(500), else: 0
-      max(500, min(2500, base + variation + spike))
+    # Get throughput data from telemetry
+    case Telemetry.get_metrics() do
+      metrics when is_map(metrics) ->
+        # Get historical throughput if available, otherwise current rate
+        history = Map.get(metrics, :message_rate_history, [])
+
+        if length(history) >= 30 do
+          # Use actual history
+          Enum.take(history, 30)
+        else
+          # Fill with current rate
+          current_rate = Map.get(metrics, :messages_per_sec, 0)
+          List.duplicate(current_rate, 30)
+        end
+
+      _ ->
+        # No metrics available, return zeros
+        List.duplicate(0, 30)
     end
+  rescue
+    _ -> List.duplicate(0, 30)
   end
 
   defp get_lag_data do
     # Consumer group lag data with labels
     groups = get_consumer_groups()
 
-    %{
-      values: Enum.map(groups, & &1.lag),
-      labels: Enum.map(groups, & &1.name)
-    }
+    if groups == [] do
+      %{
+        values: [],
+        labels: []
+      }
+    else
+      %{
+        values: Enum.map(groups, & &1.lag),
+        labels: Enum.map(groups, & &1.name)
+      }
+    end
   end
 
   defp get_topic_distribution do
@@ -208,48 +488,77 @@ defmodule KafkaesqueDashboard.DashboardLive do
   end
 
   defp get_partition_data do
-    # Generate partition health data
-    for i <- 0..11 do
-      %{
-        id: i,
-        leader: rem(i, 3),
-        replicas: 1,
-        isr: 1,
-        messages: 100_000 + :rand.uniform(50_000),
-        size_mb: 50 + :rand.uniform(100),
-        rate: 50 + :rand.uniform(150)
-      }
-    end
+    # Get partition data from all topics
+    topics = TopicSupervisor.list_topics()
+
+    Enum.flat_map(topics, fn topic ->
+      Enum.map(0..(topic.partitions - 1), fn partition ->
+        # Get partition statistics
+        {messages, size_bytes} =
+          case SingleFile.get_offsets(topic.name, partition) do
+            {:ok, %{latest: latest}} ->
+              # Get file size
+              data_dir = Application.get_env(:kafkaesque_core, :data_dir, "./data")
+              file_path = Path.join([data_dir, topic.name, "p-#{partition}.log"])
+
+              file_size =
+                case File.stat(file_path) do
+                  {:ok, %{size: size}} -> size
+                  _ -> 0
+                end
+
+              {latest + 1, file_size}
+
+            _ ->
+              {0, 0}
+          end
+
+        %{
+          id: "#{topic.name}-#{partition}",
+          # Single node
+          leader: 0,
+          replicas: 1,
+          isr: 1,
+          messages: messages,
+          size_mb: div(size_bytes, 1024 * 1024),
+          # Could get from telemetry
+          rate: 0
+        }
+      end)
+    end)
   end
 
   defp get_rebalance_events do
-    # Track recent rebalance events
-    [
-      %{time: "10:45:23", group: "analytics-pipeline", duration_ms: 1250, partitions: 8},
-      %{time: "10:42:15", group: "event-processor", duration_ms: 850, partitions: 6},
-      %{time: "10:38:47", group: "backup-writer", duration_ms: 2100, partitions: 12}
-    ]
+    # Get rebalance events from telemetry if tracked
+    # For now return empty as we don't track these events yet
+    []
   end
 
   defp get_storage_metrics do
+    # Get storage metrics from telemetry
+    telemetry_stats =
+      try do
+        Kafkaesque.Telemetry.get_metrics()
+      rescue
+        _ -> %{}
+      end
+
     %{
-      write_throughput_mbps: 45.6 + :rand.uniform() * 10,
-      read_throughput_mbps: 78.3 + :rand.uniform() * 15,
-      write_latency_ms: 2.3 + :rand.uniform() * 0.5,
-      read_latency_ms: 0.8 + :rand.uniform() * 0.2,
-      compression_ratio: 3.2,
-      cache_hit_rate: 0.87
+      write_throughput_mbps: Map.get(telemetry_stats, :write_mbps, 0),
+      read_throughput_mbps: Map.get(telemetry_stats, :read_mbps, 0),
+      write_latency_ms: Map.get(telemetry_stats, :write_latency_ms, 0),
+      read_latency_ms: Map.get(telemetry_stats, :read_latency_ms, 0),
+      # No compression in MVP
+      compression_ratio: 1.0,
+      # No cache in MVP
+      cache_hit_rate: 0.0
     }
   end
 
   defp get_consumer_activity do
-    # Track consumer join/leave activity
-    [
-      %{time: "10:46:12", event: "joined", consumer: "consumer-1", group: "analytics-pipeline"},
-      %{time: "10:45:58", event: "left", consumer: "consumer-3", group: "event-processor"},
-      %{time: "10:45:23", event: "joined", consumer: "consumer-2", group: "analytics-pipeline"},
-      %{time: "10:44:15", event: "joined", consumer: "consumer-5", group: "ml-pipeline"}
-    ]
+    # Get consumer activity from telemetry events if tracked
+    # For now return empty as we track aggregates, not individual events
+    []
   end
 
   defp attach_telemetry_handlers do
