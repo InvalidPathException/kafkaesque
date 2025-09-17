@@ -30,9 +30,8 @@ defmodule KafkaesqueServer.MixProject do
   defp deps do
     [
       {:kafkaesque_core, in_umbrella: true},
+      {:kafkaesque_proto, in_umbrella: true},
       {:phoenix, "~> 1.7"},
-      {:grpc, "~> 0.7"},
-      {:protobuf, "~> 0.12"},
       {:gun, "~> 2.0"},
       {:cowboy, "~> 2.10"},
       {:plug, "~> 1.15"},

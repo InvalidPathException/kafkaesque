@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package kafkaesque;
+
+// Topic configuration
+message Topic {
+  string name = 1;
+  int32 partitions = 2;
+}
+
+// Record header for metadata
+message RecordHeader {
+  string key = 1;
+  bytes value = 2;
+}
+
+// Individual record
+message Record {
+  bytes key = 1;
+  bytes value = 2;
+  repeated RecordHeader headers = 3;
+  int64 timestamp_ms = 4;
+}
+
+// Produce request
+message ProduceRequest {
+  string topic = 1;
+  int32 partition = 2;               // -1 = auto (MVP: 0)
+  repeated Record records = 3;
+  enum Acks {
+    ACKS_NONE = 0;
+    ACKS_LEADER = 1;
+  }
+  Acks acks = 4;
+  int32 max_batch_bytes = 5;         // advisory
+}
+
+// Produce response
+message ProduceResponse {
+  string topic = 1;
+  int32 partition = 2;
+  int64 base_offset = 3;              // first record offset
+  int32 count = 4;
+}
+
+// Consume request
+message ConsumeRequest {
+  string topic = 1;
+  int32 partition = 2;                // -1 = all (MVP: 0)
+  string group = 3;                   // for committing offsets
+  int64 offset = 4;                   // -1 = latest, -2 = earliest
+  int32 max_bytes = 5;                // soft cap
+  int32 max_wait_ms = 6;              // long-poll
+  bool auto_commit = 7;               // default true
+}
+
+// Fetched batch of records
+message FetchedBatch {
+  string topic = 1;
+  int32 partition = 2;
+  int64 high_watermark = 3;
+  int64 base_offset = 4;
+  repeated Record records = 5;
+}
+
+// Commit offsets request
+message CommitOffsetsRequest {
+  string group = 1;
+  message Offset {
+    string topic = 1;
+    int32 partition = 2;
+    int64 offset = 3;
+  }
+  repeated Offset offsets = 2;
+}
+
+// Commit offsets response
+message CommitOffsetsResponse {
+  // Empty for now, can add status later
+}
+
+// Get offsets request
+message GetOffsetsRequest {
+  string topic = 1;
+  int32 partition = 2;
+}
+
+// Get offsets response
+message GetOffsetsResponse {
+  int64 earliest = 1;
+  int64 latest = 2;
+}
+
+// Create topic request
+message CreateTopicRequest {
+  string name = 1;
+  int32 partitions = 2;
+}
+
+// List topics request (empty)
+message ListTopicsRequest {
+  // Empty for now, can add filters later
+}
+
+// List topics response
+message ListTopicsResponse {
+  repeated Topic topics = 1;
+}
+
+// Main Kafkaesque service
+service Kafkaesque {
+  rpc CreateTopic(CreateTopicRequest) returns (Topic);
+  rpc ListTopics(ListTopicsRequest) returns (ListTopicsResponse);
+  rpc Produce(ProduceRequest) returns (ProduceResponse);
+  rpc Consume(ConsumeRequest) returns (stream FetchedBatch);
+  rpc CommitOffsets(CommitOffsetsRequest) returns (CommitOffsetsResponse);
+  rpc GetOffsets(GetOffsetsRequest) returns (GetOffsetsResponse);
+}

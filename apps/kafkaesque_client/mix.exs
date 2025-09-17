@@ -28,8 +28,7 @@ defmodule KafkaesqueClient.MixProject do
 
   defp deps do
     [
-      {:grpc, "~> 0.7"},
-      {:protobuf, "~> 0.12"},
+      {:kafkaesque_proto, in_umbrella: true},
       {:gun, "~> 2.0"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.2"},

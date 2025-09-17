@@ -98,7 +98,7 @@ defmodule Kafkaesque.Integration.GRPCServiceTest do
       end
       Process.sleep(200)
 
-      result = Service.list_topics(%Google.Protobuf.Empty{}, nil)
+      result = Service.list_topics(%Kafkaesque.ListTopicsRequest{}, nil)
 
       assert %ListTopicsResponse{} = result
       assert result.topics == []
@@ -110,7 +110,7 @@ defmodule Kafkaesque.Integration.GRPCServiceTest do
       {:ok, topic2, _} = Helpers.create_test_topic(name: Factory.unique_topic_name("list2"), partitions: 2)
       {:ok, topic3, _} = Helpers.create_test_topic(name: Factory.unique_topic_name("list3"), partitions: 3)
 
-      result = Service.list_topics(%Google.Protobuf.Empty{}, nil)
+      result = Service.list_topics(%Kafkaesque.ListTopicsRequest{}, nil)
 
       assert %ListTopicsResponse{} = result
       assert length(result.topics) >= 3
@@ -204,9 +204,6 @@ defmodule Kafkaesque.Integration.GRPCServiceTest do
     end
 
     test "raises error on backpressure", %{topic: topic} do
-      # Note: This test is tricky because the queue drains quickly
-      # We'll send multiple batches rapidly to try to trigger backpressure
-
       # Create batches that will exceed queue capacity
       batch_size = 1000
       batch = Enum.map(1..batch_size, fn i ->

@@ -137,6 +137,12 @@ defmodule Kafkaesque.CreateTopicRequest do
   field(:partitions, 2, type: :int32)
 end
 
+defmodule Kafkaesque.ListTopicsRequest do
+  @moduledoc false
+
+  use Protobuf, protoc_gen_elixir_version: "0.15.0", syntax: :proto3
+end
+
 defmodule Kafkaesque.ListTopicsResponse do
   @moduledoc false
 
@@ -152,7 +158,7 @@ defmodule Kafkaesque.Kafkaesque.Service do
 
   rpc(:CreateTopic, Kafkaesque.CreateTopicRequest, Kafkaesque.Topic)
 
-  rpc(:ListTopics, Google.Protobuf.Empty, Kafkaesque.ListTopicsResponse)
+  rpc(:ListTopics, Kafkaesque.ListTopicsRequest, Kafkaesque.ListTopicsResponse)
 
   rpc(:Produce, Kafkaesque.ProduceRequest, Kafkaesque.ProduceResponse)
 

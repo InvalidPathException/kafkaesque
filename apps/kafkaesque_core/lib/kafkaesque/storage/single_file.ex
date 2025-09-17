@@ -82,6 +82,10 @@ defmodule Kafkaesque.Storage.SingleFile do
     GenServer.call(via_tuple(topic, partition), :close)
   end
 
+  def get_index_table(topic, partition) do
+    GenServer.call(via_tuple(topic, partition), :get_index_table)
+  end
+
   @impl true
   def init(opts) do
     topic = Keyword.fetch!(opts, :topic)
@@ -238,6 +242,11 @@ defmodule Kafkaesque.Storage.SingleFile do
     }
 
     {:reply, {:ok, offsets}, state}
+  end
+
+  @impl true
+  def handle_call(:get_index_table, _from, state) do
+    {:reply, {:ok, state.index.table}, state}
   end
 
   @impl true

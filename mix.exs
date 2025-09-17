@@ -40,7 +40,7 @@ defmodule Kafkaesque.MixProject do
       "format.check": ["format --check-formatted"],
       lint: ["compile --warnings-as-errors", "format.check", "credo --strict"],
       "proto.gen": [
-        "cmd protoc --elixir_out=plugins=grpc:./apps/kafkaesque_server/lib/grpc --proto_path=./proto ./proto/kafkaesque.proto"
+        "do --app kafkaesque_proto mix proto.gen"
       ],
       "assets.setup": [
         "cmd --cd apps/kafkaesque_dashboard/assets npm install"

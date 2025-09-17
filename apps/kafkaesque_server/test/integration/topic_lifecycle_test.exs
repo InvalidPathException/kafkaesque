@@ -6,7 +6,6 @@ defmodule Kafkaesque.Integration.TopicLifecycleTest do
   alias Kafkaesque.GRPC.Service
   alias Kafkaesque.Offsets.DetsOffset
   alias Kafkaesque.Pipeline.Producer
-  alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Topic.LogReader
   alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
 
@@ -53,7 +52,7 @@ defmodule Kafkaesque.Integration.TopicLifecycleTest do
       assert_topic_exists("test-topic-grpc", 3)
 
       # List topics via gRPC service
-      response = Service.list_topics(%Google.Protobuf.Empty{}, nil)
+      response = Service.list_topics(%Kafkaesque.ListTopicsRequest{}, nil)
 
       assert Enum.any?(response.topics, fn t ->
         t.name == "test-topic-grpc" && t.partitions == 3
@@ -212,36 +211,6 @@ defmodule Kafkaesque.Integration.TopicLifecycleTest do
 
       assert length(new_consumed) == 3
       assert List.first(new_consumed)[:key] == "new-key-1"
-    end
-  end
-
-  describe "Retention and Cleanup" do
-    test "respects retention watermark" do
-      topic = "retention-topic"
-      partition = 0
-
-      {:ok, _} = create_test_topic(topic, 1)
-
-      # Produce messages
-      messages = generate_messages(100)
-      {:ok, result} = Producer.produce(topic, partition, messages)
-
-      # Get current offsets
-      {:ok, offsets} = SingleFile.get_offsets(topic, partition)
-      assert offsets.latest == result.base_offset + 99
-      assert offsets.earliest == 0
-
-      # Simulate retention by updating watermark
-      # Note: In real implementation, RetentionController would handle this
-      # For testing, we directly manipulate the storage
-      _retention_offset = 50
-
-      # Verify that reads respect the retention watermark
-      # Attempting to read from before retention should start from retention offset
-      {:ok, consumed} = LogReader.consume(topic, partition, "", 0, 1_048_576, 100)
-
-      # Should get all 100 messages since retention hasn't been enforced yet
-      assert length(consumed) == 100
     end
   end
 

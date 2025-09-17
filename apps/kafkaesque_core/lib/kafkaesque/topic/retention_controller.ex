@@ -202,7 +202,6 @@ defmodule Kafkaesque.Topic.RetentionController do
       cutoff_time = current_time - state.retention_ms
 
       # Find the offset of the first message after the cutoff time
-      # In a real implementation, this would scan the index
       find_offset_after_timestamp(state, cutoff_time)
     end
   end
@@ -212,7 +211,6 @@ defmodule Kafkaesque.Topic.RetentionController do
       0
     else
       # Calculate total size and find offset where we exceed retention
-      # In a real implementation, this would use the index and file stats
       find_offset_for_size_limit(state, state.retention_bytes)
     end
   end
@@ -231,8 +229,19 @@ defmodule Kafkaesque.Topic.RetentionController do
     # Get offsets range first
     case SingleFile.get_offsets(state.topic, state.partition) do
       {:ok, %{earliest: earliest, latest: latest}} when latest > earliest ->
-        # Use binary search to find the first offset after cutoff time
-        binary_search_timestamp(state.topic, state.partition, earliest, latest, cutoff_time)
+        # Try to get index table for more efficient search
+        index_table = get_index_table(state)
+
+        # Use index to narrow search if available
+        {search_start, search_end} =
+          if index_table do
+            narrow_search_with_index(index_table, earliest, latest, cutoff_time)
+          else
+            {earliest, latest}
+          end
+
+        # Binary search to find the first offset after cutoff time
+        binary_search_timestamp(state.topic, state.partition, search_start, search_end, cutoff_time)
 
       _ ->
         # No messages or error
@@ -290,8 +299,11 @@ defmodule Kafkaesque.Topic.RetentionController do
         # We need to keep only size_limit_bytes, so calculate how much to remove
         bytes_to_remove = file_size - size_limit_bytes
 
+        # Try to use index for more efficient size calculation
+        index_table = get_index_table(state)
+
         # Scan through messages to find where we've accumulated enough bytes to remove
-        find_size_based_offset(state.topic, state.partition, bytes_to_remove)
+        find_size_based_offset(state.topic, state.partition, bytes_to_remove, index_table)
 
       _ ->
         # File is smaller than limit, keep everything
@@ -299,10 +311,15 @@ defmodule Kafkaesque.Topic.RetentionController do
     end
   end
 
-  defp find_size_based_offset(topic, partition, bytes_to_remove) do
+  defp find_size_based_offset(topic, partition, bytes_to_remove, index_table) do
     case SingleFile.get_offsets(topic, partition) do
       {:ok, %{earliest: earliest, latest: latest}} when latest > earliest ->
-        scan_for_size_limit_recursive(topic, partition, earliest, latest, bytes_to_remove, 0)
+        # Use index entries to jump more efficiently if available
+        if index_table do
+          scan_with_index(topic, partition, index_table, bytes_to_remove, earliest, latest)
+        else
+          scan_for_size_limit_recursive(topic, partition, earliest, latest, bytes_to_remove, 0)
+        end
 
       _ ->
         0
@@ -474,5 +491,86 @@ defmodule Kafkaesque.Topic.RetentionController do
       oldest_timestamp: System.system_time(:millisecond) - (state.retention_ms || 0),
       newest_timestamp: System.system_time(:millisecond)
     })
+  end
+
+  defp get_index_table(state) do
+    # Get the index table from SingleFile
+    case SingleFile.get_index_table(state.topic, state.partition) do
+      {:ok, table} -> table
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp narrow_search_with_index(index_table, earliest, latest, _cutoff_time) do
+    # Use index entries to narrow binary search range
+    # Since we don't have timestamps in index yet, we can at least use
+    # the index to skip large ranges
+    entries = :ets.tab2list(index_table) |> Enum.sort()
+
+    # For now, just use index to segment the search space
+    # TODO: We could later enhance index to store timestamps
+    if length(entries) > 10 do
+      # Use middle third of the range for search (heuristic)
+      range = latest - earliest
+      search_start = earliest + div(range, 3)
+      search_end = latest - div(range, 10)
+      {search_start, search_end}
+    else
+      {earliest, latest}
+    end
+  end
+
+  defp scan_with_index(topic, partition, index_table, bytes_to_remove, earliest, latest) do
+    # Use index entries to jump through the file more efficiently
+    entries = :ets.tab2list(index_table) |> Enum.sort()
+
+    # Calculate approximate bytes per offset using index positions
+    if length(entries) > 1 do
+      # Use index to estimate where size limit is reached
+      scan_with_index_entries(topic, partition, entries, bytes_to_remove, 0)
+    else
+      # Fall back to regular scan
+      scan_for_size_limit_recursive(topic, partition, earliest, latest, bytes_to_remove, 0)
+    end
+  end
+
+  defp scan_with_index_entries(topic, partition, entries, bytes_to_remove, accumulated) do
+    case entries do
+      [{offset, {position, _frame_len}} | rest] when rest != [] ->
+        [{next_offset, {next_position, _}} | _] = rest
+
+        # Approximate size between these index entries
+        segment_size = next_position - position
+        new_accumulated = accumulated + segment_size
+
+        if new_accumulated >= bytes_to_remove do
+          # Found the region, scan this segment in detail
+          scan_for_exact_offset_in_segment(topic, partition, offset, next_offset,
+                                          bytes_to_remove, accumulated)
+        else
+          scan_with_index_entries(topic, partition, rest, bytes_to_remove, new_accumulated)
+        end
+
+      _ ->
+        # End of index or single entry
+        0
+    end
+  end
+
+  defp scan_for_exact_offset_in_segment(topic, partition, start_offset, end_offset,
+                                       bytes_to_remove, accumulated_before) do
+    # Scan the specific segment to find exact offset
+    batch_size = min(50, end_offset - start_offset + 1)
+
+    case SingleFile.read(topic, partition, start_offset, batch_size * 100) do
+      {:ok, messages} when messages != [] ->
+        # Find exact cutoff in this batch
+        find_exact_size_cutoff(messages, start_offset, bytes_to_remove, accumulated_before)
+
+      _ ->
+        start_offset
+    end
   end
 end

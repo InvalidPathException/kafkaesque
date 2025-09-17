@@ -3,7 +3,7 @@ Application.put_env(:kafkaesque_core, :data_dir, "/tmp/kafkaesque_test/data")
 Application.put_env(:kafkaesque_core, :offsets_dir, "/tmp/kafkaesque_test/offsets")
 
 # Configure faster batching for tests
-# NOTE: All timeout values are in milliseconds for consistency
+# All timeout values are in milliseconds
 Application.put_env(:kafkaesque_core, :batch_size, 5)  # Smaller batches
 Application.put_env(:kafkaesque_core, :batch_timeout, 100)  # 100ms for faster tests
 Application.put_env(:kafkaesque_core, :fsync_interval_ms, 50)  # Faster fsync

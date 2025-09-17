@@ -14,6 +14,7 @@ defmodule Kafkaesque.GRPC.Service do
     FetchedBatch,
     GetOffsetsRequest,
     GetOffsetsResponse,
+    ListTopicsRequest,
     ListTopicsResponse,
     ProduceRequest,
     ProduceResponse,
@@ -52,7 +53,7 @@ defmodule Kafkaesque.GRPC.Service do
   @doc """
   Lists all available topics.
   """
-  def list_topics(_request, _stream) do
+  def list_topics(%ListTopicsRequest{} = _request, _stream) do
     Logger.info("gRPC: Listing topics")
 
     topics = TopicSupervisor.list_topics()
