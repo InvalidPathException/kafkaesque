@@ -265,7 +265,7 @@ defmodule Kafkaesque.Integration.GRPCServiceTest do
       result = Service.get_offsets(request, nil)
 
       assert result.earliest == 0
-      assert result.latest == produce_result.base_offset + 9  # 0-indexed from base
+      assert result.latest == produce_result.base_offset + 10  # Next offset to write
     end
 
     test "handles non-existent topic gracefully" do
@@ -414,7 +414,7 @@ defmodule Kafkaesque.Integration.GRPCServiceTest do
 
       # Verify we can consume from latest offset
       {:ok, initial_offsets} = SingleFile.get_offsets(topic, 0)
-      assert initial_offsets.latest == last_offset  # Should match what we produced
+      assert initial_offsets.latest == last_offset + 1  # Next offset to write
 
       # Produce additional messages
       new_messages = Factory.generate_messages(5, key_prefix: "latest")

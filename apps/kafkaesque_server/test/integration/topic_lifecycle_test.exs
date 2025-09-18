@@ -19,7 +19,7 @@ defmodule Kafkaesque.Integration.TopicLifecycleTest do
     end
 
     # Ensure servers are started for integration tests
-    KafkaesqueServer.TestSetup.setup_integration_test()
+    KafkaesqueTestSupport.TestSetup.setup_integration_test()
 
     # Wait a bit for server to be fully ready
     Process.sleep(500)

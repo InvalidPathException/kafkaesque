@@ -31,6 +31,7 @@ defmodule KafkaesqueServer.MixProject do
     [
       {:kafkaesque_core, in_umbrella: true},
       {:kafkaesque_proto, in_umbrella: true},
+      {:kafkaesque_test_support, in_umbrella: true, only: :test},
       {:phoenix, "~> 1.7"},
       {:gun, "~> 2.0"},
       {:cowboy, "~> 2.10"},

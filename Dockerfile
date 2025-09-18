@@ -38,6 +38,9 @@ COPY config config
 COPY apps/kafkaesque_core/mix.exs apps/kafkaesque_core/
 COPY apps/kafkaesque_server/mix.exs apps/kafkaesque_server/
 COPY apps/kafkaesque_dashboard/mix.exs apps/kafkaesque_dashboard/
+COPY apps/kafkaesque_proto/mix.exs apps/kafkaesque_proto/
+COPY apps/kafkaesque_client/mix.exs apps/kafkaesque_client/
+COPY apps/kafkaesque_test_support/mix.exs apps/kafkaesque_test_support/
 
 # Get and compile dependencies
 ENV MIX_ENV=prod
@@ -48,6 +51,9 @@ RUN mix deps.compile
 COPY apps/kafkaesque_core apps/kafkaesque_core
 COPY apps/kafkaesque_server apps/kafkaesque_server
 COPY apps/kafkaesque_dashboard apps/kafkaesque_dashboard
+COPY apps/kafkaesque_proto apps/kafkaesque_proto
+COPY apps/kafkaesque_client apps/kafkaesque_client
+COPY apps/kafkaesque_test_support apps/kafkaesque_test_support
 COPY proto proto
 
 # Copy built assets from assets stage

@@ -230,7 +230,9 @@ defmodule Kafkaesque.Pipeline.Producer do
         case SingleFile.get_offsets(state.topic, state.partition) do
           {:ok, %{latest: latest, earliest: _earliest}} ->
             # Calculate base offset (assuming messages were written sequentially)
-            base_offset = max(0, latest - count + 1)
+            # The latest offset points to the next position to write, so for count messages,
+            # the base offset is latest - count
+            base_offset = max(0, latest - count)
 
             # Reply with actual offsets
             result = %{

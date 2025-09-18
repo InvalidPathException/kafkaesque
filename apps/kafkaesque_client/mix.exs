@@ -29,6 +29,9 @@ defmodule KafkaesqueClient.MixProject do
   defp deps do
     [
       {:kafkaesque_proto, in_umbrella: true},
+      {:kafkaesque_server, in_umbrella: true, only: :test},
+      {:kafkaesque_test_support, in_umbrella: true, only: :test},
+      {:grpc, "~> 0.7"},
       {:gun, "~> 2.0"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.2"},

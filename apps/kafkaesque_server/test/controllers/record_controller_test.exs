@@ -3,6 +3,7 @@ defmodule KafkaesqueServer.RecordControllerTest do
   import Plug.Test
   import Plug.Conn
 
+  alias Kafkaesque.Offsets.DetsOffset
   alias Kafkaesque.Pipeline.Producer
   alias Kafkaesque.Test.{Factory, Helpers}
   alias KafkaesqueServer.RecordController
@@ -240,36 +241,63 @@ defmodule KafkaesqueServer.RecordControllerTest do
       assert length(response["records"]) < 20
     end
 
-    test "handles consumer group offsets", %{topic: topic} do
-      # First consume with a group
+    test "handles consumer group offsets with auto-commit", %{topic: topic, messages: messages} do
+      partition = 0
+      group = "test-group-#{:rand.uniform(1000)}"
+
+      # First consume: read first 10 messages with auto-commit
       conn1 = RecordController.consume(
         conn(:get, "/v1/topics/#{topic}/records"),
         %{
           "topic" => topic,
-          "group" => "test-group",
+          "group" => group,
           "offset" => "0",
+          "max_bytes" => "500",  # Limit to get partial messages
           "auto_commit" => "true"
         }
       )
       assert conn1.status == 200
       response1 = Jason.decode!(conn1.resp_body)
-      consumed_count = length(response1["records"])
+      first_batch_count = length(response1["records"])
+      assert first_batch_count > 0 and first_batch_count < length(messages)
 
-      # Second consume with same group should start from committed offset
+      # Verify offset was committed correctly
+      {:ok, committed_offset} = DetsOffset.fetch(topic, partition, group)
+      last_consumed = List.last(response1["records"])
+      assert committed_offset == last_consumed["offset"]
+
+      # Second consume: should start from committed offset + 1
       conn2 = RecordController.consume(
         conn(:get, "/v1/topics/#{topic}/records"),
         %{
           "topic" => topic,
-          "group" => "test-group",
-          "offset" => "-1",  # Use latest, should use committed offset
-          "auto_commit" => "true"
+          "group" => group,
+          "offset" => "-1",  # Use committed offset
+          "auto_commit" => "false"
         }
       )
       assert conn2.status == 200
       response2 = Jason.decode!(conn2.resp_body)
 
-      # Should start from where first consume left off
-      assert response2["base_offset"] >= consumed_count
+      # Verify we got the next messages (no overlap, no gap)
+      first_message = List.first(response2["records"])
+      assert first_message["offset"] == committed_offset + 1
+      assert first_message["key"] == "key-#{committed_offset + 2}"  # keys are 1-indexed
+
+      # Test with invalid group (should start from beginning or latest)
+      conn3 = RecordController.consume(
+        conn(:get, "/v1/topics/#{topic}/records"),
+        %{
+          "topic" => topic,
+          "group" => "non-existent-group",
+          "offset" => "-1",
+          "auto_commit" => "false"
+        }
+      )
+      assert conn3.status == 200
+      response3 = Jason.decode!(conn3.resp_body)
+      # Should get messages from latest (empty) or beginning based on implementation
+      assert is_list(response3["records"])
     end
 
     test "formats records correctly", %{topic: topic} do
@@ -333,23 +361,83 @@ defmodule KafkaesqueServer.RecordControllerTest do
   end
 
   describe "parameter parsing" do
-    test "parses offset correctly", %{topic: topic} do
-      # Helper function is private, test through consume
-      conn = RecordController.consume(
+    test "parses various offset formats correctly", %{topic: topic} do
+      # Test numeric offset
+      conn1 = RecordController.consume(
         conn(:get, "/v1/topics/#{topic}/records"),
         %{"topic" => topic, "offset" => "10"}
       )
-      response = Jason.decode!(conn.resp_body)
-      assert response["base_offset"] == 10
+      response1 = Jason.decode!(conn1.resp_body)
+      assert response1["base_offset"] == 10
+
+      # Test zero offset
+      conn2 = RecordController.consume(
+        conn(:get, "/v1/topics/#{topic}/records"),
+        %{"topic" => topic, "offset" => "0"}
+      )
+      response2 = Jason.decode!(conn2.resp_body)
+      assert response2["base_offset"] == 0
+
+      # Test negative offset (should use latest)
+      conn3 = RecordController.consume(
+        conn(:get, "/v1/topics/#{topic}/records"),
+        %{"topic" => topic, "offset" => "-1"}
+      )
+      assert conn3.status == 200
+      response3 = Jason.decode!(conn3.resp_body)
+      # Should be at or near the end
+      assert response3["base_offset"] >= 0
+
+      # Test very large offset (beyond end)
+      conn4 = RecordController.consume(
+        conn(:get, "/v1/topics/#{topic}/records"),
+        %{"topic" => topic, "offset" => "999999"}
+      )
+      response4 = Jason.decode!(conn4.resp_body)
+      # Should get empty result but valid response
+      assert conn4.status == 200
+      assert response4["records"] == []
     end
 
-    test "handles invalid offset gracefully", %{topic: topic} do
-      conn = RecordController.consume(
+    test "handles invalid offset formats gracefully", %{topic: topic} do
+      # Test non-numeric string
+      conn1 = RecordController.consume(
         conn(:get, "/v1/topics/#{topic}/records"),
         %{"topic" => topic, "offset" => "invalid"}
       )
-      # Should default to latest
-      assert conn.status == 200
+      assert conn1.status == 200
+      response1 = Jason.decode!(conn1.resp_body)
+      # Should default to latest (-1)
+      assert is_integer(response1["base_offset"])
+
+      # Test empty string
+      conn2 = RecordController.consume(
+        conn(:get, "/v1/topics/#{topic}/records"),
+        %{"topic" => topic, "offset" => ""}
+      )
+      assert conn2.status == 200
+
+      # Test nil/missing (defaults to latest)
+      conn3 = RecordController.consume(
+        conn(:get, "/v1/topics/#{topic}/records"),
+        %{"topic" => topic}
+      )
+      assert conn3.status == 200
+
+      # Test special strings
+      conn4 = RecordController.consume(
+        conn(:get, "/v1/topics/#{topic}/records"),
+        %{"topic" => topic, "offset" => "latest"}
+      )
+      assert conn4.status == 200
+
+      conn5 = RecordController.consume(
+        conn(:get, "/v1/topics/#{topic}/records"),
+        %{"topic" => topic, "offset" => "earliest"}
+      )
+      assert conn5.status == 200
+      response5 = Jason.decode!(conn5.resp_body)
+      assert response5["base_offset"] == 0
     end
 
     test "converts headers format correctly", %{topic: topic} do
