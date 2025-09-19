@@ -325,19 +325,20 @@ defmodule Kafkaesque.GRPC.Service do
 
             case safe_send_reply(stream, batch) do
               :ok ->
-                # Auto-commit if enabled
+                # Calculate last offset first
                 last_offset = offset + length(records) - 1
 
-                if auto_commit and group != "" do
-                  DetsOffset.commit(topic, partition, group, last_offset)
-                end
-
-                # Update state and continue
+                # Update state before committing
                 new_state = %{
                   state
                   | messages_sent: state.messages_sent + length(records),
                     last_heartbeat: now
                 }
+
+                # Auto-commit AFTER successful send confirmation
+                if auto_commit and group != "" do
+                  DetsOffset.commit(topic, partition, group, last_offset)
+                end
 
                 # Continue consuming from the next offset
                 consume_loop_with_state(
@@ -429,7 +430,14 @@ defmodule Kafkaesque.GRPC.Service do
     GRPC.Server.send_reply(stream, message)
     :ok
   rescue
+    error in [RuntimeError, ArgumentError] ->
+      # These are typically client disconnect errors
+      Logger.debug("Client stream closed during send: #{inspect(error)}")
+      {:error, error}
+
     error ->
+      # Unexpected errors should be logged at warning level
+      Logger.warning("Unexpected error sending to stream: #{inspect(error)}")
       {:error, error}
   end
 end
