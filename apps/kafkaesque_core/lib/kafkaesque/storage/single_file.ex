@@ -648,10 +648,20 @@ defmodule Kafkaesque.Storage.SingleFile do
   defp parse_frame_content(
          <<@magic_byte, crc::32, attr, timestamp::64, key_len::32, key::binary-size(key_len),
            val_len::32, value::binary-size(val_len), headers_len::16,
-           headers_data::binary-size(headers_len), _rest::binary>>
+           headers_data::binary-size(headers_len), rest::binary>> = frame_data
        ) do
-    # Validate sizes
+    # Calculate expected frame size
+    expected_size = 1 + 4 + 1 + 8 + 4 + key_len + 4 + val_len + 2 + headers_len
+    actual_size = byte_size(frame_data)
+
+    # Validate frame size matches expected size
     cond do
+      actual_size != expected_size ->
+        {:error, :frame_size_mismatch}
+
+      byte_size(rest) != 0 ->
+        {:error, :frame_has_trailing_data}
+
       key_len > Constants.max_key_size() ->
         {:error, :key_too_large}
 

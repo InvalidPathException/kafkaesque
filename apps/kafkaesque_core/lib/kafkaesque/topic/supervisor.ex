@@ -21,13 +21,13 @@ defmodule Kafkaesque.Topic.Supervisor do
   @doc """
   Creates a new topic with the specified number of partitions.
   """
-  def create_topic(name, partitions \\ 1) when is_binary(name) and partitions > 0 do
+  def create_topic(name, partitions \\ 1, opts \\ []) when is_binary(name) and partitions > 0 do
     Logger.debug("Creating topic '#{name}' with #{partitions} partitions")
 
     # Start supervisor for each partition
     results =
       Enum.map(0..(partitions - 1), fn partition ->
-        start_partition(name, partition)
+        start_partition(name, partition, opts)
       end)
 
     # Check if all partitions started successfully
@@ -167,11 +167,11 @@ defmodule Kafkaesque.Topic.Supervisor do
     |> Enum.any?()
   end
 
-  defp start_partition(topic, partition) do
+  defp start_partition(topic, partition, opts) do
     child_spec = %{
       id: {topic, partition},
       start:
-        {__MODULE__.PartitionSupervisor, :start_link, [[topic: topic, partition: partition]]},
+        {__MODULE__.PartitionSupervisor, :start_link, [Keyword.merge([topic: topic, partition: partition], opts)]},
       type: :supervisor,
       restart: :permanent
     }
@@ -237,10 +237,10 @@ defmodule Kafkaesque.Topic.Supervisor.PartitionSupervisor do
        [
          topic: topic,
          partition: partition,
-         batch_size: Application.get_env(:kafkaesque_core, :max_batch_size, 500),
-         batch_timeout: Application.get_env(:kafkaesque_core, :batch_timeout, 5000),
-         min_demand: Application.get_env(:kafkaesque_core, :min_demand, 5),
-         max_demand: Application.get_env(:kafkaesque_core, :max_batch_size, 500)
+         batch_size: Keyword.get(opts, :batch_size, Application.get_env(:kafkaesque_core, :max_batch_size, 500)),
+         batch_timeout: Keyword.get(opts, :batch_timeout, Application.get_env(:kafkaesque_core, :batch_timeout, 5000)),
+         min_demand: Keyword.get(opts, :min_demand, Application.get_env(:kafkaesque_core, :min_demand, 5)),
+         max_demand: Keyword.get(opts, :max_demand, Application.get_env(:kafkaesque_core, :max_batch_size, 500))
        ]},
 
       # Log reader for consuming
