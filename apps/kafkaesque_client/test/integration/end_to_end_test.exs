@@ -17,10 +17,26 @@ defmodule KafkaesqueClient.Integration.EndToEndTest do
     Application.ensure_all_started(:kafkaesque_server)
     Application.ensure_all_started(:grpc)
 
+    # Stop any existing gRPC server first
+    try do
+      GRPC.Server.stop_endpoint(KafkaesqueServer.GRPC.Endpoint)
+    rescue
+      _ -> :ok
+    catch
+      _ -> :ok
+    end
+
     # Start the gRPC server on test port 50052
     case GRPC.Server.start_endpoint(KafkaesqueServer.GRPC.Endpoint, 50_052) do
       {:ok, _pid, port} ->
         IO.puts("Started gRPC server on port #{port}")
+        on_exit(fn ->
+          try do
+            GRPC.Server.stop_endpoint(KafkaesqueServer.GRPC.Endpoint)
+          rescue
+            _ -> :ok
+          end
+        end)
       {:error, {:already_started, _}} ->
         IO.puts("gRPC server already started")
       {:error, :eaddrinuse} ->
@@ -411,6 +427,47 @@ defmodule KafkaesqueClient.Integration.EndToEndTest do
       p1_info = Enum.find(description.partition_info, & &1.partition == 1)
       assert p1_info.message_count == 0
       assert p1_info.latest_offset == 0
+
+      :ok = Producer.close(producer)
+      :ok = Admin.close(admin)
+    end
+  end
+
+  describe "Async Flush" do
+    test "async flush works correctly in producer", %{topic: topic} do
+      {:ok, admin} = KafkaesqueClient.create_admin(
+        bootstrap_servers: ["localhost:50052"]
+      )
+      {:ok, _} = Admin.create_topic(admin, topic)
+
+      {:ok, producer} = KafkaesqueClient.create_producer(
+        bootstrap_servers: ["localhost:50052"],
+        batch_size: 1024,
+        linger_ms: 60_000  # Very long linger
+      )
+
+      test_pid = self()
+
+      # Send records with callbacks
+      for i <- 1..5 do
+        record = ProducerRecord.new(topic, "async-#{i}")
+        Producer.send(producer, record, fn {:ok, metadata} ->
+          send(test_pid, {:sent, i, metadata})
+        end)
+      end
+
+      # Async flush should return immediately
+      start = System.monotonic_time(:millisecond)
+      :ok = Producer.flush_async(producer)
+      duration = System.monotonic_time(:millisecond) - start
+
+      # Should be very fast (< 10ms)
+      assert duration < 10
+
+      # Wait for callbacks to confirm sends completed
+      for i <- 1..5 do
+        assert_receive {:sent, ^i, %{topic: ^topic}}, 5_000
+      end
 
       :ok = Producer.close(producer)
       :ok = Admin.close(admin)

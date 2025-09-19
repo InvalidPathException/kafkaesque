@@ -25,7 +25,9 @@ defmodule KafkaesqueClient.Consumer do
     :stream_task,
     :consumer_group,
     :last_commit_time,
-    :metrics
+    :metrics,
+    :closed,
+    :auto_commit_timer
   ]
 
   @type t :: %__MODULE__{
@@ -40,7 +42,9 @@ defmodule KafkaesqueClient.Consumer do
           stream_task: Task.t() | nil,
           consumer_group: pid() | nil,
           last_commit_time: integer(),
-          metrics: map()
+          metrics: map(),
+          closed: boolean(),
+          auto_commit_timer: reference() | nil
         }
 
   # Client API
@@ -164,7 +168,9 @@ defmodule KafkaesqueClient.Consumer do
         polls: 0,
         commits: 0,
         errors: 0
-      }
+      },
+      closed: false,
+      auto_commit_timer: nil
     }
 
     # Start consumer group coordinator if we have a group
@@ -177,8 +183,11 @@ defmodule KafkaesqueClient.Consumer do
       end
 
     # Start auto-commit timer if enabled
-    if config.enable_auto_commit do
-      Process.send_after(self(), :auto_commit, config.auto_commit_interval_ms)
+    state = if config.enable_auto_commit do
+      timer_ref = Process.send_after(self(), :auto_commit, config.auto_commit_interval_ms)
+      %{state | auto_commit_timer: timer_ref}
+    else
+      state
     end
 
     {:ok, state}
@@ -272,6 +281,14 @@ defmodule KafkaesqueClient.Consumer do
   end
 
   def handle_call(:close, _from, state) do
+    # Mark as closed to prevent further operations
+    state = %{state | closed: true}
+
+    # Cancel auto-commit timer if active
+    if state.auto_commit_timer do
+      Process.cancel_timer(state.auto_commit_timer)
+    end
+
     # Commit offsets if auto-commit is enabled
     if state.config.enable_auto_commit do
       commit_current_offsets(state)
@@ -288,15 +305,20 @@ defmodule KafkaesqueClient.Consumer do
   end
 
   @impl true
+  def handle_info(:auto_commit, %{closed: true} = state) do
+    # Consumer is closed, ignore auto-commit
+    {:noreply, state}
+  end
+
   def handle_info(:auto_commit, state) do
     if should_auto_commit?(state) do
       commit_current_offsets(state)
     end
 
     # Schedule next auto-commit
-    Process.send_after(self(), :auto_commit, state.config.auto_commit_interval_ms)
+    timer_ref = Process.send_after(self(), :auto_commit, state.config.auto_commit_interval_ms)
 
-    {:noreply, %{state | last_commit_time: System.monotonic_time(:millisecond)}}
+    {:noreply, %{state | last_commit_time: System.monotonic_time(:millisecond), auto_commit_timer: timer_ref}}
   end
 
   def handle_info({:batch_received, batch}, state) do
@@ -531,6 +553,7 @@ defmodule KafkaesqueClient.Consumer do
 
   defp should_auto_commit?(state) do
     state.config.enable_auto_commit &&
+      not state.closed &&
       MapSet.size(state.subscriptions) > 0 &&
       map_size(state.position) > 0
   end

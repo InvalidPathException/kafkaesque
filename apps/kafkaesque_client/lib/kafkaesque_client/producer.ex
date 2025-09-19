@@ -20,7 +20,8 @@ defmodule KafkaesqueClient.Producer do
     :batch_timer,
     :callbacks,
     :metrics,
-    :flush_waiters
+    :flush_waiters,
+    :cleanup_timer
   ]
 
   @type t :: %__MODULE__{
@@ -28,9 +29,10 @@ defmodule KafkaesqueClient.Producer do
           pool: atom() | pid(),
           batch: [ProducerRecord.t()],
           batch_timer: reference() | nil,
-          callbacks: %{reference() => function()},
+          callbacks: %{reference() => {function() | {:sync, GenServer.from()}, integer()}},
           metrics: map(),
-          flush_waiters: [GenServer.from()]
+          flush_waiters: [GenServer.from()],
+          cleanup_timer: reference() | nil
         }
 
   @type send_callback :: (
@@ -52,6 +54,7 @@ defmodule KafkaesqueClient.Producer do
   - `:linger_ms` - Time to wait before sending incomplete batches (default: 100)
   - `:max_retries` - Maximum number of retries (default: 3)
   - `:retry_backoff_ms` - Backoff between retries (default: 100)
+  - `:callback_timeout_ms` - Timeout for callbacks before cleanup (default: 30000)
   """
   def start_link(config) when is_map(config) do
     case Config.validate_producer_config(config) do
@@ -81,11 +84,20 @@ defmodule KafkaesqueClient.Producer do
   end
 
   @doc """
-  Flushes any pending records in the batch.
+  Flushes any pending records in the batch synchronously.
   """
   @spec flush(GenServer.server(), timeout()) :: :ok
   def flush(producer, timeout \\ 5_000) do
     GenServer.call(producer, :flush, timeout)
+  end
+
+  @doc """
+  Flushes any pending records in the batch asynchronously.
+  Returns immediately without waiting for the batch to be sent.
+  """
+  @spec flush_async(GenServer.server()) :: :ok
+  def flush_async(producer) do
+    GenServer.cast(producer, :flush_async)
   end
 
   @doc """
@@ -118,13 +130,19 @@ defmodule KafkaesqueClient.Producer do
         records_sent: 0,
         batches_sent: 0,
         errors: 0,
-        retries: 0
+        retries: 0,
+        callbacks_timeout: 0
       },
-      flush_waiters: []
+      flush_waiters: [],
+      cleanup_timer: nil
     }
 
     # Start batch timer if linger_ms > 0
     state = maybe_start_batch_timer(state)
+
+    # Start callback cleanup timer
+    cleanup_timer = Process.send_after(self(), :cleanup_callbacks, 5_000)
+    state = %{state | cleanup_timer: cleanup_timer}
 
     {:ok, state}
   end
@@ -135,7 +153,7 @@ defmodule KafkaesqueClient.Producer do
 
     new_callbacks =
       if callback do
-        Map.put(state.callbacks, ref, callback)
+        Map.put(state.callbacks, ref, {callback, System.monotonic_time(:millisecond)})
       else
         state.callbacks
       end
@@ -154,12 +172,20 @@ defmodule KafkaesqueClient.Producer do
     end
   end
 
+  def handle_cast(:flush_async, state) do
+    if Enum.empty?(state.batch) do
+      {:noreply, state}
+    else
+      {:noreply, send_batch(state)}
+    end
+  end
+
   @impl true
   def handle_call({:send_sync, record}, from, state) do
     ref = make_ref()
 
     # Store the caller to reply when batch is sent
-    new_callbacks = Map.put(state.callbacks, ref, {:sync, from})
+    new_callbacks = Map.put(state.callbacks, ref, {{:sync, from}, System.monotonic_time(:millisecond)})
 
     record_with_ref = {record, ref}
     new_batch = [record_with_ref | state.batch]
@@ -187,9 +213,12 @@ defmodule KafkaesqueClient.Producer do
     # Send any pending batch
     final_state = if Enum.empty?(state.batch), do: state, else: send_batch(state)
 
-    # Cancel timer if active
+    # Cancel timers if active
     if final_state.batch_timer do
       Process.cancel_timer(final_state.batch_timer)
+    end
+    if final_state.cleanup_timer do
+      Process.cancel_timer(final_state.cleanup_timer)
     end
 
     {:stop, :normal, :ok, final_state}
@@ -202,6 +231,33 @@ defmodule KafkaesqueClient.Producer do
   @impl true
   def handle_info(:send_batch, state) do
     {:noreply, send_batch(%{state | batch_timer: nil})}
+  end
+
+  def handle_info(:cleanup_callbacks, state) do
+    now = System.monotonic_time(:millisecond)
+    timeout_ms = Map.get(state.config, :callback_timeout_ms, 30_000)
+
+    {expired, active} =
+      Map.split_with(state.callbacks, fn {_ref, {_cb, timestamp}} ->
+        now - timestamp > timeout_ms
+      end)
+
+    # Execute expired callbacks with timeout error
+    Enum.each(expired, fn {_ref, {callback, _timestamp}} ->
+      execute_callback_with_error(callback, :timeout)
+    end)
+
+    # Update metrics
+    new_metrics = if map_size(expired) > 0 do
+      %{state.metrics | callbacks_timeout: state.metrics.callbacks_timeout + map_size(expired)}
+    else
+      state.metrics
+    end
+
+    # Schedule next cleanup
+    cleanup_timer = Process.send_after(self(), :cleanup_callbacks, 5_000)
+
+    {:noreply, %{state | callbacks: active, cleanup_timer: cleanup_timer, metrics: new_metrics}}
   end
 
   # Private Functions
@@ -330,10 +386,10 @@ defmodule KafkaesqueClient.Producer do
       case Map.get(state.callbacks, ref) do
         nil -> :ok
 
-        {:sync, from} ->
+        {{:sync, from}, _timestamp} ->
           GenServer.reply(from, {:ok, metadata})
 
-        callback when is_function(callback, 1) ->
+        {callback, _timestamp} when is_function(callback, 1) ->
           Task.start(fn -> callback.({:ok, metadata}) end)
       end
     end)
@@ -345,13 +401,21 @@ defmodule KafkaesqueClient.Producer do
       case Map.get(state.callbacks, ref) do
         nil -> :ok
 
-        {:sync, from} ->
+        {{:sync, from}, _timestamp} ->
           GenServer.reply(from, {:error, reason})
 
-        callback when is_function(callback, 1) ->
+        {callback, _timestamp} when is_function(callback, 1) ->
           Task.start(fn -> callback.({:error, reason}) end)
       end
     end)
+  end
+
+  defp execute_callback_with_error({:sync, from}, reason) do
+    GenServer.reply(from, {:error, reason})
+  end
+
+  defp execute_callback_with_error(callback, reason) when is_function(callback, 1) do
+    Task.start(fn -> callback.({:error, reason}) end)
   end
 
   defp map_acks(:none), do: :ACKS_NONE
