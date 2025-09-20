@@ -16,7 +16,14 @@ defmodule KafkaesqueServer.TopicController do
     else
       Logger.info("REST: Creating topic #{name} with #{partitions} partitions")
 
-      case TopicSupervisor.create_topic(name, partitions) do
+      # Extract batch configuration from request
+      opts = []
+      opts = maybe_add_opt(opts, :batch_size, params["batch_size"])
+      opts = maybe_add_opt(opts, :batch_timeout, params["batch_timeout_ms"])
+      opts = maybe_add_opt(opts, :min_demand, params["min_demand"])
+      opts = maybe_add_opt(opts, :max_demand, params["max_demand"])
+
+      case TopicSupervisor.create_topic(name, partitions, opts) do
         {:ok, info} ->
           conn
           |> put_status(:created)
@@ -33,6 +40,11 @@ defmodule KafkaesqueServer.TopicController do
       end
     end
   end
+
+  defp maybe_add_opt(opts, key, value) when is_integer(value) and value > 0 do
+    [{key, value} | opts]
+  end
+  defp maybe_add_opt(opts, _key, _value), do: opts
 
   def index(conn, _params) do
     Logger.info("REST: Listing topics")

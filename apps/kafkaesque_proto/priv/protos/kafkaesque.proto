@@ -95,6 +95,12 @@ message GetOffsetsResponse {
 message CreateTopicRequest {
   string name = 1;
   int32 partitions = 2;
+
+  // Optional batch configuration
+  int32 batch_size = 3;        // Max records per batch (default: 500)
+  int32 batch_timeout_ms = 4;  // Max wait time in ms (default: 5000)
+  int32 min_demand = 5;        // Min demand for GenStage (default: 5)
+  int32 max_demand = 6;        // Max demand for GenStage (default: 500)
 }
 
 // List topics request (empty)

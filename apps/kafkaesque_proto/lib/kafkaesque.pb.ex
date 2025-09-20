@@ -135,6 +135,10 @@ defmodule Kafkaesque.CreateTopicRequest do
 
   field(:name, 1, type: :string)
   field(:partitions, 2, type: :int32)
+  field(:batch_size, 3, type: :int32, json_name: "batchSize")
+  field(:batch_timeout_ms, 4, type: :int32, json_name: "batchTimeoutMs")
+  field(:min_demand, 5, type: :int32, json_name: "minDemand")
+  field(:max_demand, 6, type: :int32, json_name: "maxDemand")
 end
 
 defmodule Kafkaesque.ListTopicsRequest do

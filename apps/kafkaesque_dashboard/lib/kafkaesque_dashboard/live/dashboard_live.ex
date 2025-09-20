@@ -198,42 +198,34 @@ defmodule KafkaesqueDashboard.DashboardLive do
   end
 
   defp get_disk_usage(path) do
-    # Get actual disk usage for the data directory
-    case System.cmd("df", ["-k", path]) do
-      {output, 0} ->
-        # Parse df output
-        lines = String.split(output, "\n")
+    used_bytes = calculate_directory_size(path)
 
-        case Enum.at(lines, 1) do
-          nil ->
-            %{used_gb: 0.0, total_gb: 10.0}
+    # Try to get total disk space using Erlang's disk_info if available
+    total_gb =
+      case :disksup.get_disk_data() do
+        [_|_] = disks ->
+          # Find the disk containing our path
+          disk = Enum.find(disks, fn {mount, _size, _used} ->
+            String.starts_with?(path, to_string(mount))
+          end)
 
-          line ->
-            parts = String.split(line, ~r/\s+/)
+          case disk do
+            {_mount, size_kb, _used} ->
+              size_kb / (1024 * 1024)
+            _ ->
+              100.0  # Default 100GB if we can't determine
+          end
 
-            case parts do
-              [_filesystem, total_kb, used_kb | _] ->
-                %{
-                  used_gb: String.to_integer(used_kb) / (1024 * 1024),
-                  total_gb: String.to_integer(total_kb) / (1024 * 1024)
-                }
+        _ ->
+          100.0  # Default 100GB if disksup is not available
+      end
 
-              _ ->
-                %{used_gb: 0.0, total_gb: 10.0}
-            end
-        end
-
-      _ ->
-        # Fallback: calculate size of all files in data directory
-        used_bytes = calculate_directory_size(path)
-
-        %{
-          used_gb: used_bytes / (1024 * 1024 * 1024),
-          total_gb: 10.0
-        }
-    end
+    %{
+      used_gb: used_bytes / (1024 * 1024 * 1024),
+      total_gb: total_gb
+    }
   rescue
-    _ -> %{used_gb: 0.0, total_gb: 10.0}
+    _ -> %{used_gb: 0.0, total_gb: 100.0}
   end
 
   defp calculate_directory_size(path) do
@@ -341,100 +333,12 @@ defmodule KafkaesqueDashboard.DashboardLive do
   end
 
   defp get_consumer_groups do
-    # Get all consumer groups by scanning offset tables
-    offsets_dir = Application.get_env(:kafkaesque_core, :offsets_dir, "./offsets")
-
-    case File.ls(offsets_dir) do
-      {:ok, files} ->
-        # Parse DETS files to find unique consumer groups
-        groups =
-          files
-          |> Enum.filter(&String.ends_with?(&1, "_offsets.dets"))
-          |> Enum.flat_map(fn file ->
-            extract_consumer_groups_from_file(Path.join(offsets_dir, file))
-          end)
-          |> Enum.group_by(& &1.name)
-          |> Enum.map(fn {group_name, group_data} ->
-            # Aggregate data for each group
-            total_lag = Enum.reduce(group_data, 0, fn g, acc -> acc + g.lag end)
-
-            %{
-              name: group_name,
-              lag: total_lag,
-              # Approximate by partition count
-              members: length(group_data),
-              # Default state, could be enhanced with real tracking
-              state: "stable"
-            }
-          end)
-
-        if groups == [] do
-          # Return empty list if no consumer groups
-          []
-        else
-          groups
-        end
-
-      _ ->
-        []
-    end
-  end
-
-  defp extract_consumer_groups_from_file(file_path) do
-    # Parse filename to get topic and partition
-    basename = Path.basename(file_path, "_offsets.dets")
-
-    case String.split(basename, "_") do
-      [topic | rest] when rest != [] ->
-        partition_str = List.last(rest)
-        partition = String.to_integer(partition_str || "0")
-        topic_name = Enum.join([topic | Enum.drop(rest, -1)], "_")
-
-        # Open DETS file to read consumer groups
-        table_name = String.to_atom("temp_#{:erlang.unique_integer([:positive])}")
-
-        case :dets.open_file(table_name, file: String.to_charlist(file_path), access: :read) do
-          {:ok, _} ->
-            groups = extract_groups_from_table(table_name, topic_name, partition)
-            :dets.close(table_name)
-            groups
-
-          _ ->
-            []
-        end
-
-      _ ->
-        []
-    end
-  end
-
-  defp extract_groups_from_table(table_name, topic, partition) do
-    # Read all entries from DETS table
-    case :dets.match_object(table_name, :_) do
-      entries when is_list(entries) ->
-        entries
-        |> Enum.map(fn
-          {{^topic, ^partition, group}, offset} ->
-            # Calculate lag by comparing with latest offset
-            latest = get_latest_offset(topic, partition)
-            lag = max(0, latest - offset)
-            %{name: group, lag: lag, topic: topic, partition: partition}
-
-          _ ->
-            nil
-        end)
-        |> Enum.reject(&is_nil/1)
-
-      _ ->
-        []
-    end
-  end
-
-  defp get_latest_offset(topic, partition) do
-    case SingleFile.get_offsets(topic, partition) do
-      {:ok, %{latest: latest}} -> latest
-      _ -> 0
-    end
+    # Get cached consumer groups data from MetricsCache
+    KafkaesqueDashboard.MetricsCache.get_consumer_groups()
+  rescue
+    _ ->
+      # Fallback to empty list if cache is not available
+      []
   end
 
   defp get_throughput_data do
@@ -670,6 +574,16 @@ defmodule KafkaesqueDashboard.DashboardLive do
   end
 
   @impl true
+  def terminate(_reason, _socket) do
+    # Detach all telemetry handlers to prevent memory leak
+    Enum.each(@telemetry_events, fn event ->
+      handler_id = "dashboard-#{Enum.join(event, "-")}"
+      :telemetry.detach(handler_id)
+    end)
+    :ok
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <div class="min-h-screen bg-dark-bg p-6">
@@ -679,7 +593,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
           <h1 class="text-4xl font-light text-dark-text mb-2">Kafkaesque Dashboard</h1>
           <p class="text-dark-muted">Real-time monitoring for your distributed log system</p>
         </div>
-        
+
     <!-- Key Metrics -->
         <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-4 mb-8">
           <.metric_card
@@ -717,7 +631,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
             value={"#{Float.round(@topic_stats.storage_size_gb, 1)} GB"}
           />
         </div>
-        
+
     <!-- Main Charts Row -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
           <!-- Throughput Chart -->
@@ -733,7 +647,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
               socket={@socket}
             />
           </.panel>
-          
+
     <!-- Consumer Lag Chart -->
           <.panel title="Consumer Group Lag">
             <.svelte
@@ -749,7 +663,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
             />
           </.panel>
         </div>
-        
+
     <!-- System Resources Row -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
           <!-- Resource Gauges -->
@@ -795,7 +709,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
               />
             </div>
           </.panel>
-          
+
     <!-- Topic Distribution -->
           <.panel title="Topic Size Distribution">
             <.svelte
@@ -810,7 +724,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
               socket={@socket}
             />
           </.panel>
-          
+
     <!-- Network Stats -->
           <.panel title="Network I/O">
             <div class="space-y-6">
@@ -840,7 +754,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
             </div>
           </.panel>
         </div>
-        
+
     <!-- Tables Row -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
           <!-- Topics Table -->
@@ -852,7 +766,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
               <:col label="Size" field={:size_mb} />
             </.data_table>
           </.panel>
-          
+
     <!-- Consumer Groups Table -->
           <.panel title="Consumer Groups">
             <.data_table rows={@consumer_groups}>
@@ -863,7 +777,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
             </.data_table>
           </.panel>
         </div>
-        
+
     <!-- Partition Health -->
         <.panel title="Partition Health">
           <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
@@ -887,7 +801,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
             <% end %>
           </div>
         </.panel>
-        
+
     <!-- Storage & I/O Metrics Row -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8 mt-8">
           <!-- Storage Metrics -->
@@ -936,7 +850,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
               </div>
             </div>
           </.panel>
-          
+
     <!-- Rebalance Events -->
           <.panel title="Recent Rebalances">
             <div class="space-y-2">
@@ -963,7 +877,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
               <% end %>
             </div>
           </.panel>
-          
+
     <!-- Consumer Activity -->
           <.panel title="Consumer Activity">
             <div class="space-y-2">
@@ -991,7 +905,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
             </div>
           </.panel>
         </div>
-        
+
     <!-- Event Stream & Latency Percentiles -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
           <!-- Topic Events -->
@@ -1021,7 +935,7 @@ defmodule KafkaesqueDashboard.DashboardLive do
               <% end %>
             </div>
           </.panel>
-          
+
     <!-- Latency Percentiles -->
           <.panel title="Consumer Latency Percentiles">
             <div class="space-y-4">

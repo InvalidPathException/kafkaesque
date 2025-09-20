@@ -34,9 +34,25 @@ defmodule KafkaesqueClient.Admin do
   @doc """
   Creates a new topic with the specified configuration.
 
+  ## Options
+
+  - `:partitions` - Number of partitions (default: 1)
+  - `:batch_size` - Max records per batch (default: 500)
+  - `:batch_timeout` - Batch timeout in milliseconds (default: 5000)
+  - `:min_demand` - Min demand for GenStage (default: 5)
+  - `:max_demand` - Max demand for GenStage (default: 500)
+
   ## Examples
 
       Admin.create_topic(admin, "my-topic", partitions: 3)
+
+      Admin.create_topic(admin, "high-throughput",
+        partitions: 5,
+        batch_size: 1000,
+        batch_timeout: 1000,
+        min_demand: 10,
+        max_demand: 1000
+      )
   """
   @spec create_topic(GenServer.server(), String.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
@@ -140,10 +156,18 @@ defmodule KafkaesqueClient.Admin do
   @impl true
   def handle_call({:create_topic, topic_name, opts}, _from, state) do
     partitions = Keyword.get(opts, :partitions, 1)
+    batch_size = Keyword.get(opts, :batch_size, 0)
+    batch_timeout_ms = Keyword.get(opts, :batch_timeout, 0)
+    min_demand = Keyword.get(opts, :min_demand, 0)
+    max_demand = Keyword.get(opts, :max_demand, 0)
 
     request = %Kafkaesque.CreateTopicRequest{
       name: topic_name,
-      partitions: partitions
+      partitions: partitions,
+      batch_size: batch_size,
+      batch_timeout_ms: batch_timeout_ms,
+      min_demand: min_demand,
+      max_demand: max_demand
     }
 
     result =

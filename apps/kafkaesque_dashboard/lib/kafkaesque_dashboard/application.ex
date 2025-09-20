@@ -11,6 +11,7 @@ defmodule KafkaesqueDashboard.Application do
     children = [
       {NodeJS.Supervisor, [path: SSR.NodeJS.server_path(), pool_size: 4]},
       Telemetry,
+      KafkaesqueDashboard.MetricsCache,
       Endpoint
     ]
 

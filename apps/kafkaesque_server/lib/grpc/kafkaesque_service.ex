@@ -34,14 +34,21 @@ defmodule Kafkaesque.GRPC.Service do
   @doc """
   Creates a new topic with the specified number of partitions.
   """
-  def create_topic(%CreateTopicRequest{name: name, partitions: partitions}, _stream) do
-    Logger.info("gRPC: Creating topic #{name} with #{partitions} partitions")
+  def create_topic(%CreateTopicRequest{} = request, _stream) do
+    Logger.info("gRPC: Creating topic #{request.name} with #{request.partitions} partitions")
 
-    partitions = if partitions <= 0, do: 1, else: partitions
+    partitions = if request.partitions <= 0, do: 1, else: request.partitions
 
-    case TopicSupervisor.create_topic(name, partitions) do
+    # Extract batch configuration options
+    opts = []
+    opts = if request.batch_size > 0, do: [{:batch_size, request.batch_size} | opts], else: opts
+    opts = if request.batch_timeout_ms > 0, do: [{:batch_timeout, request.batch_timeout_ms} | opts], else: opts
+    opts = if request.min_demand > 0, do: [{:min_demand, request.min_demand} | opts], else: opts
+    opts = if request.max_demand > 0, do: [{:max_demand, request.max_demand} | opts], else: opts
+
+    case TopicSupervisor.create_topic(request.name, partitions, opts) do
       {:ok, _info} ->
-        %Topic{name: name, partitions: partitions}
+        %Topic{name: request.name, partitions: partitions}
 
       {:error, reason} ->
         raise GRPC.RPCError,
