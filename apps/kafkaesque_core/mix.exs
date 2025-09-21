@@ -37,6 +37,7 @@ defmodule KafkaesqueCore.MixProject do
       {:jason, "~> 1.4"},
       {:nimble_options, "~> 1.1"},
       {:typed_struct, "~> 0.3"},
+      {:poolboy, "~> 1.5"},
       {:stream_data, "~> 1.0", only: :test},
       {:benchee, "~> 1.3", only: :dev}
     ]

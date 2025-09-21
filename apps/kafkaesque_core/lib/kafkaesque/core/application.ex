@@ -10,7 +10,9 @@ defmodule Kafkaesque.Core.Application do
       Kafkaesque.Topic.Supervisor,
       {Phoenix.PubSub, name: Kafkaesque.PubSub, adapter: Phoenix.PubSub.PG2},
       Kafkaesque.Telemetry.Supervisor,
-      Kafkaesque.Telemetry
+      Kafkaesque.Telemetry,
+      Kafkaesque.Health.Monitor,
+      Kafkaesque.Workers.PoolSupervisor
     ]
 
     opts = [strategy: :one_for_one, name: Kafkaesque.Core.Supervisor]
