@@ -160,6 +160,10 @@ defmodule KafkaesqueClient.Connection.Channel do
     Stub.list_topics(channel, request)
   end
 
+  defp execute_request(channel, {:describe_topic, request}, _opts) do
+    Stub.describe_topic(channel, request)
+  end
+
   defp execute_request(channel, {:commit_offsets, request}, _opts) do
     Stub.commit_offsets(channel, request)
   end

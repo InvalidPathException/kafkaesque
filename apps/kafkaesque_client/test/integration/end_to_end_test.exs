@@ -389,6 +389,35 @@ defmodule KafkaesqueClient.Integration.EndToEndTest do
       :ok = Admin.close(admin)
     end
 
+    test "producer routes records based on key and round-robin" do
+      {:ok, admin} = KafkaesqueClient.create_admin(
+        bootstrap_servers: ["localhost:50052"]
+      )
+
+      topic = "routing-test-#{:rand.uniform(100_000)}"
+      {:ok, _} = Admin.create_topic(admin, topic, partitions: 3)
+
+      {:ok, producer} = KafkaesqueClient.create_producer(
+        bootstrap_servers: ["localhost:50052"]
+      )
+
+      keyed_record = %ProducerRecord{topic: topic, key: "user-123", value: "payload"}
+      {:ok, keyed_metadata} = Producer.send_sync(producer, keyed_record)
+      assert keyed_metadata.partition == :erlang.phash2("user-123", 3)
+
+      record_a = ProducerRecord.new(topic, "round-robin-a")
+      {:ok, metadata_a} = Producer.send_sync(producer, record_a)
+      record_b = ProducerRecord.new(topic, "round-robin-b")
+      {:ok, metadata_b} = Producer.send_sync(producer, record_b)
+
+      # Default round-robin should iterate partitions starting from 0
+      assert metadata_a.partition == 0
+      assert metadata_b.partition == 1
+
+      :ok = Producer.close(producer)
+      :ok = Admin.close(admin)
+    end
+
     test "describes topic with partition info" do
       {:ok, admin} = KafkaesqueClient.create_admin(
         bootstrap_servers: ["localhost:50052"]

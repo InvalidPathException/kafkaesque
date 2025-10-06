@@ -13,6 +13,10 @@ defmodule KafkaesqueClient.Producer do
   alias KafkaesqueClient.Record.{ProducerRecord, RecordMetadata}
   alias KafkaesqueClient.Telemetry
 
+  alias Kafkaesque.DescribeTopicRequest
+
+  @metadata_ttl 60_000
+
   defstruct [
     :config,
     :pool,
@@ -21,7 +25,8 @@ defmodule KafkaesqueClient.Producer do
     :callbacks,
     :metrics,
     :flush_waiters,
-    :cleanup_timer
+    :cleanup_timer,
+    :metadata_cache
   ]
 
   @type t :: %__MODULE__{
@@ -32,7 +37,8 @@ defmodule KafkaesqueClient.Producer do
           callbacks: %{reference() => {function() | {:sync, GenServer.from()}, integer()}},
           metrics: map(),
           flush_waiters: [GenServer.from()],
-          cleanup_timer: reference() | nil
+          cleanup_timer: reference() | nil,
+          metadata_cache: %{optional(String.t()) => map()}
         }
 
   @type send_callback :: (
@@ -134,7 +140,8 @@ defmodule KafkaesqueClient.Producer do
         callbacks_timeout: 0
       },
       flush_waiters: [],
-      cleanup_timer: nil
+      cleanup_timer: nil,
+      metadata_cache: %{}
     }
 
     # Start batch timer if linger_ms > 0
@@ -289,57 +296,79 @@ defmodule KafkaesqueClient.Producer do
   defp send_batch(%{batch: []} = state), do: state
 
   defp send_batch(state) do
-    # Cancel any existing timer
     if state.batch_timer do
       Process.cancel_timer(state.batch_timer)
     end
 
-    # Group records by topic
-    batches_by_topic =
+    grouped_by_topic =
       state.batch
-      |> Enum.reverse()  # Preserve order
+      |> Enum.reverse()
       |> Enum.group_by(fn {record, _ref} -> record.topic end)
 
-    # Send each topic batch
-    Enum.each(batches_by_topic, fn {topic, records_with_refs} ->
-      send_topic_batch(state, topic, records_with_refs)
-    end)
+    total_records = length(state.batch)
+    topic_count = map_size(grouped_by_topic)
 
-    # Reply to flush waiters
+    state =
+      Enum.reduce(grouped_by_topic, state, fn {topic, records_with_refs}, acc ->
+        send_topic_batch(acc, topic, records_with_refs)
+      end)
+
     Enum.each(state.flush_waiters, fn from ->
       GenServer.reply(from, :ok)
     end)
 
-    # Update metrics
     new_metrics = %{
       state.metrics
-      | records_sent: state.metrics.records_sent + length(state.batch),
-        batches_sent: state.metrics.batches_sent + map_size(batches_by_topic)
+      | records_sent: state.metrics.records_sent + total_records,
+        batches_sent: state.metrics.batches_sent + topic_count
     }
 
     %{state | batch: [], batch_timer: nil, flush_waiters: [], metrics: new_metrics}
   end
 
   defp send_topic_batch(state, topic, records_with_refs) do
+    case get_topic_metadata(state, topic) do
+      {:ok, state_with_metadata} ->
+        assign_and_send(state_with_metadata, topic, records_with_refs)
+
+      {:error, reason, new_state} ->
+        refs = Enum.map(records_with_refs, fn {_record, ref} -> ref end)
+        handle_error(new_state, reason, refs)
+    end
+  end
+
+  defp assign_and_send(state, topic, records_with_refs) do
+    {state, batches_by_partition} =
+      Enum.reduce(records_with_refs, {state, %{}}, fn {record, ref}, {acc_state, acc_map} ->
+        case assign_partition(acc_state, topic, record) do
+          {:ok, partition, updated_state} ->
+            updated_map = Map.update(acc_map, partition, [{record, ref}], &[{record, ref} | &1])
+            {updated_state, updated_map}
+
+          {:error, reason, updated_state} ->
+            {handle_error(updated_state, reason, [ref]), acc_map}
+        end
+      end)
+
+    Enum.reduce(batches_by_partition, state, fn {partition, partition_records}, acc_state ->
+      send_partition_batch(acc_state, topic, partition, Enum.reverse(partition_records))
+    end)
+  end
+
+  defp send_partition_batch(state, topic, partition, records_with_refs) do
     {records, refs} = Enum.unzip(records_with_refs)
 
-    # Convert to protobuf records
     proto_records = Enum.map(records, &ProducerRecord.to_proto/1)
 
-    # Build produce request
     request = %Kafkaesque.ProduceRequest{
       topic: topic,
-      partition: 0,
+      partition: partition,
       records: proto_records,
       acks: map_acks(state.config.acks),
       max_batch_bytes: state.config.batch_size
     }
 
-    # Execute with retries
-    result = execute_with_retry(state, {:produce, request}, state.config.max_retries)
-
-    # Process callbacks
-    case result do
+    case execute_with_retry(state, {:produce, request}, state.config.max_retries) do
       {:ok, response} ->
         handle_success(state, response, records, refs)
 
@@ -393,22 +422,108 @@ defmodule KafkaesqueClient.Producer do
           Task.start(fn -> callback.({:ok, metadata}) end)
       end
     end)
+
+    new_callbacks = Map.drop(state.callbacks, refs)
+    %{state | callbacks: new_callbacks}
   end
 
   defp handle_error(state, reason, refs) do
-    # Execute error callbacks
     Enum.each(refs, fn ref ->
       case Map.get(state.callbacks, ref) do
         nil -> :ok
-
-        {{:sync, from}, _timestamp} ->
-          GenServer.reply(from, {:error, reason})
-
-        {callback, _timestamp} when is_function(callback, 1) ->
-          Task.start(fn -> callback.({:error, reason}) end)
+        {{:sync, from}, _timestamp} -> GenServer.reply(from, {:error, reason})
+        {callback, _timestamp} when is_function(callback, 1) -> Task.start(fn -> callback.({:error, reason}) end)
       end
     end)
+
+    new_callbacks = Map.drop(state.callbacks, refs)
+    new_metrics = %{state.metrics | errors: state.metrics.errors + length(refs)}
+    %{state | callbacks: new_callbacks, metrics: new_metrics}
   end
+
+  defp get_topic_metadata(state, topic) do
+    now = System.system_time(:millisecond)
+
+    case Map.get(state.metadata_cache, topic) do
+      %{fetched_at: fetched_at} = _entry when now - fetched_at <= @metadata_ttl ->
+        {:ok, state}
+
+      existing_entry ->
+        describe_request = %DescribeTopicRequest{topic: topic}
+
+        case Pool.execute(state.pool, {:describe_topic, describe_request}) do
+          {:ok, response} ->
+            metadata = build_metadata(response)
+            round_robin = Map.get(existing_entry || %{}, :round_robin, 0)
+            cache_entry = %{metadata: metadata, fetched_at: now, round_robin: round_robin}
+            {:ok, %{state | metadata_cache: Map.put(state.metadata_cache, topic, cache_entry)}}
+
+          {:error, %GRPC.RPCError{status: 5}} ->
+            {:error, "Topic #{topic} does not exist", state}
+
+          {:error, reason} ->
+            {:error, reason, state}
+        end
+    end
+  end
+
+  defp build_metadata(response) do
+    partition_ids =
+      response.partition_infos
+      |> Enum.map(& &1.partition)
+      |> Enum.sort()
+
+    %{
+      name: response.topic,
+      partitions: response.partitions,
+      partition_ids: partition_ids,
+      retention_hours: response.retention_hours,
+      created_at_ms: response.created_at_ms,
+      partition_infos: response.partition_infos
+    }
+  end
+
+  defp assign_partition(state, topic, %ProducerRecord{} = record) do
+    entry = Map.fetch!(state.metadata_cache, topic)
+    metadata = entry.metadata
+
+    if metadata.partitions <= 0 do
+      {:error, "Topic #{metadata.name} has no partitions", state}
+    else
+      cond do
+        not is_nil(record.partition) ->
+          validate_explicit_partition(state, topic, record.partition, metadata)
+
+        valid_key?(record.key) ->
+          partition = :erlang.phash2(record.key, metadata.partitions)
+          {:ok, partition, state}
+
+        true ->
+          partition = rem(entry.round_robin, metadata.partitions)
+          new_entry = %{entry | round_robin: entry.round_robin + 1}
+          new_state = %{state | metadata_cache: Map.put(state.metadata_cache, topic, new_entry)}
+          {:ok, partition, new_state}
+      end
+    end
+  end
+
+  defp validate_explicit_partition(state, _topic, partition, metadata) do
+    if Enum.member?(metadata.partition_ids, partition) do
+      {:ok, partition, state}
+    else
+      reason = invalid_partition_error(metadata.name, partition, metadata.partition_ids)
+      {:error, reason, state}
+    end
+  end
+
+  defp invalid_partition_error(topic, partition, partition_ids) do
+    available = Enum.map_join(partition_ids, ", ", &Integer.to_string/1)
+    "Invalid partition #{partition} for topic #{topic} (available: #{available})"
+  end
+
+  defp valid_key?(nil), do: false
+  defp valid_key?(<<>>), do: false
+  defp valid_key?(_), do: true
 
   defp execute_callback_with_error({:sync, from}, reason) do
     GenServer.reply(from, {:error, reason})

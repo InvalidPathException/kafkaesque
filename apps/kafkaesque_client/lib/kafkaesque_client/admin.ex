@@ -258,46 +258,42 @@ defmodule KafkaesqueClient.Admin do
   end
 
   def handle_call({:describe_topic, topic_name}, _from, state) do
-    # Get basic topic info by listing topics and filtering
-    request = %Kafkaesque.ListTopicsRequest{}
+    request = %Kafkaesque.DescribeTopicRequest{topic: topic_name}
 
     result =
-      case Pool.execute(state.pool, {:list_topics, request}) do
+      case Pool.execute(state.pool, {:describe_topic, request}) do
         {:ok, response} ->
-          case Enum.find(response.topics, fn t -> t.name == topic_name end) do
-            nil ->
-              {:error, :topic_not_found}
-
-            topic ->
-              # Get offsets for each partition
-              partition_info =
-                for partition <- 0..(topic.partitions - 1) do
-                  offsets_req = %Kafkaesque.GetOffsetsRequest{
-                    topic: topic_name,
-                    partition: partition
-                  }
-
-                  offsets =
-                    case Pool.execute(state.pool, {:get_offsets, offsets_req}) do
-                      {:ok, resp} -> %{earliest: resp.earliest, latest: resp.latest}
-                      _ -> %{earliest: 0, latest: 0}
-                    end
-
-                  %{
-                    partition: partition,
-                    earliest_offset: offsets.earliest,
-                    latest_offset: offsets.latest,
-                    message_count: offsets.latest - offsets.earliest
-                  }
+          partition_info =
+            Enum.map(response.partition_infos, fn info ->
+              next_offset =
+                if info.latest_offset < 0 do
+                  0
+                else
+                  info.latest_offset + 1
                 end
 
-              {:ok,
-               %{
-                 name: topic.name,
-                 partitions: topic.partitions,
-                 partition_info: partition_info
-               }}
-          end
+              message_count = max(next_offset - info.earliest_offset, 0)
+
+              %{
+                partition: info.partition,
+                earliest_offset: info.earliest_offset,
+                latest_offset: next_offset,
+                message_count: message_count,
+                size_bytes: info.size_bytes
+              }
+            end)
+
+          {:ok,
+           %{
+             name: response.topic,
+             partitions: response.partitions,
+             retention_hours: response.retention_hours,
+             created_at_ms: response.created_at_ms,
+             partition_info: partition_info
+           }}
+
+        {:error, %GRPC.RPCError{status: 5}} ->
+          {:error, :topic_not_found}
 
         {:error, reason} ->
           {:error, reason}
