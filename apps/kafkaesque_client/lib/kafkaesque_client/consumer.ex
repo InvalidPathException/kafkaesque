@@ -7,11 +7,14 @@ defmodule KafkaesqueClient.Consumer do
   use GenServer
   require Logger
 
+  alias Kafkaesque.DescribeTopicRequest
   alias Kafkaesque.Kafkaesque.Stub
   alias KafkaesqueClient.Config
   alias KafkaesqueClient.Connection.Pool
   alias KafkaesqueClient.ConsumerGroup
   alias KafkaesqueClient.Record.{ConsumerRecord, OffsetAndMetadata, TopicPartition}
+
+  @metadata_ttl 60_000
 
   defstruct [
     :config,
@@ -20,14 +23,14 @@ defmodule KafkaesqueClient.Consumer do
     :subscriptions,
     :assignments,
     :position,
-    :stream,
     :buffer,
-    :stream_task,
     :consumer_group,
     :last_commit_time,
     :metrics,
     :closed,
-    :auto_commit_timer
+    :auto_commit_timer,
+    :metadata_cache,
+    :stream_tasks
   ]
 
   @type t :: %__MODULE__{
@@ -37,14 +40,14 @@ defmodule KafkaesqueClient.Consumer do
           subscriptions: MapSet.t(String.t()),
           assignments: [TopicPartition.t()],
           position: %{TopicPartition.t() => integer()},
-          stream: GenServer.server() | nil,
           buffer: :queue.queue(),
-          stream_task: Task.t() | nil,
           consumer_group: pid() | nil,
           last_commit_time: integer(),
           metrics: map(),
           closed: boolean(),
-          auto_commit_timer: reference() | nil
+          auto_commit_timer: reference() | nil,
+          metadata_cache: %{optional(String.t()) => %{metadata: map(), fetched_at: integer()}},
+          stream_tasks: %{TopicPartition.t() => Task.t()}
         }
 
   # Client API
@@ -158,9 +161,7 @@ defmodule KafkaesqueClient.Consumer do
       subscriptions: MapSet.new(),
       assignments: [],
       position: %{},
-      stream: nil,
       buffer: :queue.new(),
-      stream_task: nil,
       consumer_group: nil,
       last_commit_time: System.monotonic_time(:millisecond),
       metrics: %{
@@ -170,7 +171,9 @@ defmodule KafkaesqueClient.Consumer do
         errors: 0
       },
       closed: false,
-      auto_commit_timer: nil
+      auto_commit_timer: nil,
+      metadata_cache: %{},
+      stream_tasks: %{}
     }
 
     # Start consumer group coordinator if we have a group
@@ -195,32 +198,48 @@ defmodule KafkaesqueClient.Consumer do
 
   @impl true
   def handle_call({:subscribe, topics}, _from, state) do
-    new_subscriptions = MapSet.union(state.subscriptions, MapSet.new(topics))
+    case ensure_topics_metadata(state, topics) do
+      {:ok, metadata_list, state_with_meta} ->
+        new_subscriptions = MapSet.union(state_with_meta.subscriptions, MapSet.new(topics))
 
-    # For MVP, assign all topics with partition 0
-    new_assignments =
-      Enum.map(topics, fn topic ->
-        TopicPartition.new(topic, 0)
-      end)
+        assignment_set =
+          metadata_list
+          |> Enum.reduce(MapSet.new(state_with_meta.assignments), fn metadata, acc ->
+            Enum.reduce(metadata.partition_ids, acc, fn partition, set ->
+              MapSet.put(set, TopicPartition.new(metadata.name, partition))
+            end)
+          end)
 
-    # Initialize positions
-    new_position =
-      Enum.reduce(new_assignments, state.position, fn tp, pos ->
-        initial = determine_initial_offset(state, tp)
-        Map.put_new(pos, tp, initial)
-      end)
+        new_assignments =
+          assignment_set
+          |> Enum.to_list()
+          |> Enum.sort_by(fn %TopicPartition{topic: topic, partition: partition} -> {topic, partition} end)
 
-    new_state = %{
-      state
-      | subscriptions: new_subscriptions,
-        assignments: new_assignments,
-        position: new_position
-    }
+        new_position =
+          Enum.reduce(new_assignments, state_with_meta.position, fn tp, pos ->
+            Map.put_new(pos, tp, determine_initial_offset(state_with_meta, tp))
+          end)
 
-    # Start streaming if not already started
-    new_state = maybe_start_stream(new_state)
+        new_state = %{
+          state_with_meta
+          | subscriptions: new_subscriptions,
+            assignments: new_assignments,
+            position: new_position
+        }
 
-    {:reply, :ok, new_state}
+        new_state = ensure_partition_streams(new_state)
+
+        {:reply, :ok, new_state}
+
+      {:error, {:topic_not_found, topic}, new_state} ->
+        {:reply, {:error, "Topic #{topic} does not exist"}, new_state}
+
+      {:error, {:rpc_error, reason}, new_state} ->
+        {:reply, {:error, reason}, new_state}
+
+      {:error, reason, new_state} ->
+        {:reply, {:error, reason}, new_state}
+    end
   end
 
   def handle_call({:poll, timeout}, _from, state) do
@@ -265,18 +284,18 @@ defmodule KafkaesqueClient.Consumer do
 
     # Restart stream to seek
     new_state = %{state | position: new_position}
-    new_state = restart_stream(new_state)
+    new_state = restart_partition_stream(new_state, tp)
 
     {:reply, :ok, new_state}
   end
 
   def handle_call({:pause, _partitions}, _from, state) do
-    new_state = stop_stream(state)
+    new_state = stop_all_streams(state)
     {:reply, :ok, new_state}
   end
 
   def handle_call({:resume, _partitions}, _from, state) do
-    new_state = maybe_start_stream(state)
+    new_state = ensure_partition_streams(state)
     {:reply, :ok, new_state}
   end
 
@@ -294,8 +313,8 @@ defmodule KafkaesqueClient.Consumer do
       commit_current_offsets(state)
     end
 
-    # Stop the stream
-    final_state = stop_stream(state)
+    # Stop active streams
+    final_state = stop_all_streams(state)
 
     {:stop, :normal, :ok, final_state}
   end
@@ -321,44 +340,90 @@ defmodule KafkaesqueClient.Consumer do
     {:noreply, %{state | last_commit_time: System.monotonic_time(:millisecond), auto_commit_timer: timer_ref}}
   end
 
-  def handle_info({:batch_received, batch}, state) do
-    # Add batch to buffer
+  def handle_info({:partition_batch, _tp, batch}, state) do
     records = ConsumerRecord.from_batch(batch)
     new_buffer = Enum.reduce(records, state.buffer, &:queue.in(&1, &2))
-
-    # Track batch receipt (use trace level for detailed logging)
 
     {:noreply, %{state | buffer: new_buffer}}
   end
 
-  def handle_info({:stream_error, reason}, state) do
-    Logger.error("Stream error: #{inspect(reason)}")
+  def handle_info({:partition_stream_error, tp, reason}, state) do
+    Logger.error("Stream error on #{inspect(tp)}: #{inspect(reason)}")
 
     new_metrics = %{
       state.metrics
       | errors: state.metrics.errors + 1
     }
 
-    # Restart stream after error
     new_state = %{state | metrics: new_metrics}
-    new_state = restart_stream(new_state)
+    new_state = restart_partition_stream(new_state, tp)
 
     {:noreply, new_state}
   end
 
-  def handle_info({:stream_ended, _reason}, state) do
-    # Stream ended normally, restart if still subscribed
-    new_state =
-      if MapSet.size(state.subscriptions) > 0 do
-        maybe_start_stream(state)
-      else
-        state
-      end
-
+  def handle_info({:partition_stream_ended, tp, _reason}, state) do
+    new_state = restart_partition_stream(state, tp)
     {:noreply, new_state}
   end
 
   # Private Functions
+
+  defp ensure_topics_metadata(state, topics) do
+    Enum.reduce_while(topics, {:ok, [], state}, fn topic, {:ok, metadata_acc, acc_state} ->
+      case get_topic_metadata(acc_state, topic) do
+        {:ok, metadata, updated_state} ->
+          {:cont, {:ok, [metadata | metadata_acc], updated_state}}
+
+        {:error, reason, updated_state} ->
+          {:halt, {:error, reason, updated_state}}
+      end
+    end)
+    |> case do
+      {:ok, metadata_list, final_state} -> {:ok, Enum.reverse(metadata_list), final_state}
+      {:error, reason, final_state} -> {:error, reason, final_state}
+    end
+  end
+
+  defp get_topic_metadata(state, topic) do
+    now = System.system_time(:millisecond)
+
+    case Map.get(state.metadata_cache, topic) do
+      %{metadata: metadata, fetched_at: fetched_at} when now - fetched_at <= @metadata_ttl ->
+        {:ok, metadata, state}
+
+      _ ->
+        request = %DescribeTopicRequest{topic: topic}
+
+        case Pool.execute(state.pool, {:describe_topic, request}) do
+          {:ok, response} ->
+            metadata = build_metadata(response)
+            cache_entry = %{metadata: metadata, fetched_at: now}
+            new_state = %{state | metadata_cache: Map.put(state.metadata_cache, topic, cache_entry)}
+            {:ok, metadata, new_state}
+
+          {:error, %GRPC.RPCError{status: 5}} ->
+            {:error, {:topic_not_found, topic}, state}
+
+          {:error, reason} ->
+            {:error, {:rpc_error, reason}, state}
+        end
+    end
+  end
+
+  defp build_metadata(response) do
+    partition_ids =
+      response.partition_infos
+      |> Enum.map(& &1.partition)
+      |> Enum.sort()
+
+    %{
+      name: response.topic,
+      partitions: response.partitions,
+      partition_ids: partition_ids,
+      retention_hours: response.retention_hours,
+      created_at_ms: response.created_at_ms
+    }
+  end
 
   defp determine_initial_offset(state, %TopicPartition{} = tp) do
     # Check if we have a committed offset for this consumer group
@@ -381,127 +446,144 @@ defmodule KafkaesqueClient.Consumer do
     end
   end
 
-  defp maybe_start_stream(%{stream_task: nil} = state) do
-    if length(state.assignments) > 0 do
-      start_stream(state)
-    else
+  defp ensure_partition_streams(%{assignments: []} = state) do
+    stop_all_streams(state)
+  end
+
+  defp ensure_partition_streams(state) do
+    desired_set = MapSet.new(state.assignments)
+
+    state =
+      Enum.reduce(state.assignments, state, fn tp, acc ->
+        maybe_start_partition_stream(acc, tp)
+      end)
+
+    stop_streams_not_in(state, desired_set)
+  end
+
+  defp maybe_start_partition_stream(state, tp) do
+    if Map.has_key?(state.stream_tasks, tp) do
       state
+    else
+      start_partition_stream(state, tp)
     end
   end
 
-  defp maybe_start_stream(state), do: state
+  defp start_partition_stream(state, %TopicPartition{topic: topic, partition: partition} = tp) do
+    offset = Map.get(state.position, tp, determine_initial_offset(state, tp))
+    actual_offset = resolve_start_offset(state, tp, offset)
 
-  defp start_stream(state) do
-    case List.first(state.assignments) do
-      nil ->
-        state
+    request = %Kafkaesque.ConsumeRequest{
+      topic: topic,
+      partition: partition,
+      group: state.group_id,
+      offset: actual_offset,
+      max_bytes: 1_000_000,
+      max_wait_ms: state.config.fetch_max_wait_ms,
+      auto_commit: false
+    }
 
-      %TopicPartition{topic: topic, partition: partition} = tp ->
-        offset = Map.get(state.position, tp, 0)
+    Logger.info("Starting consumer stream for #{topic}/#{partition} at offset #{actual_offset}")
 
-        # Handle :latest by getting the latest offset from server
-        actual_offset =
-          case offset do
-            :latest ->
-              # Get latest offset from server (which is next write position)
-              # So we start from there to get only new messages
-              case get_latest_offset(state, topic, partition) do
-                {:ok, latest} -> latest
-                {:error, reason} ->
-                  Logger.error("Failed to get latest offset for #{topic}/#{partition}: #{inspect(reason)}")
-                  0
-              end
-            o when is_integer(o) -> o
-          end
+    parent = self()
 
-        # Create consume request
-        request = %Kafkaesque.ConsumeRequest{
-          topic: topic,
-          partition: partition,
-          group: state.group_id,
-          offset: actual_offset,
-          max_bytes: 1_000_000,
-          max_wait_ms: state.config.fetch_max_wait_ms,
-          auto_commit: false  # We handle commits manually
-        }
-
-        Logger.info("Starting consumer stream for #{topic}/#{partition} at offset #{actual_offset}")
-
-        # Start streaming task
-        parent = self()
-
-        task =
-          Task.async(fn ->
-            # Stream task starting for topic/partition
-
-            # Get channel directly and create stream in this process
-            case Pool.get_channel(state.pool) do
-              {:ok, channel} ->
-                # Create stream directly with the channel
-                case Stub.consume(channel, request, timeout: :infinity) do
-                  {:ok, stream} ->
-                    stream_loop(stream, parent)
-
-                  {:error, reason} ->
-                    Logger.error("Failed to create stream: #{inspect(reason)}")
-                    send(parent, {:stream_error, reason})
-                end
-
-              {:error, reason} ->
-                Logger.error("Failed to get channel: #{inspect(reason)}")
-                send(parent, {:stream_error, reason})
+    task =
+      Task.async(fn ->
+        case Pool.get_channel(state.pool) do
+          {:ok, channel} ->
+            case Stub.consume(channel, request, timeout: :infinity) do
+              {:ok, stream} -> stream_loop(stream, parent, tp)
+              {:error, reason} -> send(parent, {:partition_stream_error, tp, reason})
             end
-          end)
 
-        %{state | stream_task: task}
+          {:error, reason} ->
+            send(parent, {:partition_stream_error, tp, reason})
+        end
+      end)
+
+    %{state | stream_tasks: Map.put(state.stream_tasks, tp, task)}
+  end
+
+  defp resolve_start_offset(state, %TopicPartition{topic: topic, partition: partition}, offset) do
+    case offset do
+      :latest ->
+        case get_latest_offset(state, topic, partition) do
+          {:ok, latest} -> latest
+          {:error, reason} ->
+            Logger.error("Failed to get latest offset for #{topic}/#{partition}: #{inspect(reason)}")
+            0
+        end
+
+      value when is_integer(value) -> value
     end
   end
 
-  defp stream_loop(stream, parent) do
-    # Try using Stream.take with timeout
-    taken = stream
-      |> Stream.take(1)
-      |> Enum.to_list()
-
-    # Process stream result
+  defp stream_loop(stream, parent, tp) do
+    taken = stream |> Stream.take(1) |> Enum.to_list()
 
     case taken do
       [{:ok, batch}] ->
-        send(parent, {:batch_received, batch})
-        stream_loop(stream, parent)
+        send(parent, {:partition_batch, tp, batch})
+        stream_loop(stream, parent, tp)
 
       [{:error, reason}] ->
-        Logger.error("Stream error: #{inspect(reason)}")
-        send(parent, {:stream_error, reason})
+        send(parent, {:partition_stream_error, tp, reason})
 
       [batch] when is_map(batch) ->
-        send(parent, {:batch_received, batch})
-        stream_loop(stream, parent)
+        send(parent, {:partition_batch, tp, batch})
+        stream_loop(stream, parent, tp)
 
       [] ->
-        send(parent, {:stream_ended, :normal})
+        send(parent, {:partition_stream_ended, tp, :normal})
 
       other ->
-        Logger.warning("Unexpected stream result: #{inspect(other)}")
-        send(parent, {:stream_ended, :unexpected})
+        Logger.warning("Unexpected stream result for #{inspect(tp)}: #{inspect(other)}")
+        send(parent, {:partition_stream_ended, tp, :unexpected})
     end
   catch
     kind, error ->
-      Logger.error("Stream loop caught #{kind}: #{inspect(error)}")
-      send(parent, {:stream_error, error})
+      Logger.error("Stream loop caught #{kind} for #{inspect(tp)}: #{inspect(error)}")
+      send(parent, {:partition_stream_error, tp, error})
   end
 
-  defp stop_stream(%{stream_task: nil} = state), do: state
-
-  defp stop_stream(%{stream_task: task} = state) do
-    Task.shutdown(task, :brutal_kill)
-    %{state | stream_task: nil, stream: nil}
+  defp restart_partition_stream(state, tp) do
+    if Enum.any?(state.assignments, &(&1 == tp)) do
+      state
+      |> stop_partition_stream(tp)
+      |> maybe_start_partition_stream(tp)
+    else
+      stop_partition_stream(state, tp)
+    end
   end
 
-  defp restart_stream(state) do
-    state
-    |> stop_stream()
-    |> maybe_start_stream()
+  defp stop_partition_stream(state, tp) do
+    case Map.pop(state.stream_tasks, tp) do
+      {nil, tasks} ->
+        %{state | stream_tasks: tasks}
+
+      {task, tasks} ->
+        Task.shutdown(task, :brutal_kill)
+        %{state | stream_tasks: tasks}
+    end
+  end
+
+  defp stop_streams_not_in(state, desired_set) do
+    stream_tasks =
+      Enum.reduce(state.stream_tasks, %{}, fn {tp, task}, acc ->
+        if MapSet.member?(desired_set, tp) do
+          Map.put(acc, tp, task)
+        else
+          Task.shutdown(task, :brutal_kill)
+          acc
+        end
+      end)
+
+    %{state | stream_tasks: stream_tasks}
+  end
+
+  defp stop_all_streams(state) do
+    Enum.each(state.stream_tasks, fn {_tp, task} -> Task.shutdown(task, :brutal_kill) end)
+    %{state | stream_tasks: %{}}
   end
 
   defp poll_records_with_buffer(state, timeout) do

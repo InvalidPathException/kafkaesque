@@ -418,6 +418,47 @@ defmodule KafkaesqueClient.Integration.EndToEndTest do
       :ok = Admin.close(admin)
     end
 
+    test "consumer polls records from multiple partitions" do
+      {:ok, admin} = KafkaesqueClient.create_admin(
+        bootstrap_servers: ["localhost:50052"]
+      )
+
+      topic = "consumer-routing-#{:rand.uniform(100_000)}"
+      {:ok, _} = Admin.create_topic(admin, topic, partitions: 2)
+
+      {:ok, producer} = KafkaesqueClient.create_producer(
+        bootstrap_servers: ["localhost:50052"]
+      )
+
+      record_p0 = %ProducerRecord{topic: topic, partition: 0, value: "p0"}
+      record_p1 = %ProducerRecord{topic: topic, partition: 1, value: "p1"}
+
+      {:ok, _} = Producer.send_sync(producer, record_p0)
+      {:ok, _} = Producer.send_sync(producer, record_p1)
+
+      {:ok, consumer} = KafkaesqueClient.create_consumer(
+        bootstrap_servers: ["localhost:50052"],
+        group_id: "cg-#{:rand.uniform(100_000)}",
+        auto_offset_reset: :earliest,
+        enable_auto_commit: false
+      )
+
+      assert :ok == Consumer.subscribe(consumer, [topic])
+
+      # Poll until we observe both partitions or timeout
+      records =
+        Stream.repeatedly(fn -> Consumer.poll(consumer, 1_000) end)
+        |> Stream.take(5)
+        |> Enum.reduce([], fn batch, acc -> acc ++ batch end)
+
+      partitions = records |> Enum.map(& &1.partition) |> Enum.sort() |> Enum.uniq()
+      assert partitions == [0, 1]
+
+      :ok = Consumer.close(consumer)
+      :ok = Producer.close(producer)
+      :ok = Admin.close(admin)
+    end
+
     test "describes topic with partition info" do
       {:ok, admin} = KafkaesqueClient.create_admin(
         bootstrap_servers: ["localhost:50052"]

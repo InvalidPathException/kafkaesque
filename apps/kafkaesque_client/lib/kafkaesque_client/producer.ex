@@ -328,8 +328,8 @@ defmodule KafkaesqueClient.Producer do
 
   defp send_topic_batch(state, topic, records_with_refs) do
     case get_topic_metadata(state, topic) do
-      {:ok, state_with_metadata} ->
-        assign_and_send(state_with_metadata, topic, records_with_refs)
+      {:ok, metadata, state_with_metadata} ->
+        assign_and_send(state_with_metadata, topic, metadata, records_with_refs)
 
       {:error, reason, new_state} ->
         refs = Enum.map(records_with_refs, fn {_record, ref} -> ref end)
@@ -337,10 +337,10 @@ defmodule KafkaesqueClient.Producer do
     end
   end
 
-  defp assign_and_send(state, topic, records_with_refs) do
+  defp assign_and_send(state, topic, metadata, records_with_refs) do
     {state, batches_by_partition} =
       Enum.reduce(records_with_refs, {state, %{}}, fn {record, ref}, {acc_state, acc_map} ->
-        case assign_partition(acc_state, topic, record) do
+        case assign_partition(acc_state, topic, metadata, record) do
           {:ok, partition, updated_state} ->
             updated_map = Map.update(acc_map, partition, [{record, ref}], &[{record, ref} | &1])
             {updated_state, updated_map}
@@ -445,8 +445,8 @@ defmodule KafkaesqueClient.Producer do
     now = System.system_time(:millisecond)
 
     case Map.get(state.metadata_cache, topic) do
-      %{fetched_at: fetched_at} = _entry when now - fetched_at <= @metadata_ttl ->
-        {:ok, state}
+      %{fetched_at: fetched_at, metadata: metadata} when now - fetched_at <= @metadata_ttl ->
+        {:ok, metadata, state}
 
       existing_entry ->
         describe_request = %DescribeTopicRequest{topic: topic}
@@ -456,7 +456,8 @@ defmodule KafkaesqueClient.Producer do
             metadata = build_metadata(response)
             round_robin = Map.get(existing_entry || %{}, :round_robin, 0)
             cache_entry = %{metadata: metadata, fetched_at: now, round_robin: round_robin}
-            {:ok, %{state | metadata_cache: Map.put(state.metadata_cache, topic, cache_entry)}}
+            new_state = %{state | metadata_cache: Map.put(state.metadata_cache, topic, cache_entry)}
+            {:ok, metadata, new_state}
 
           {:error, %GRPC.RPCError{status: 5}} ->
             {:error, "Topic #{topic} does not exist", state}
@@ -483,27 +484,25 @@ defmodule KafkaesqueClient.Producer do
     }
   end
 
-  defp assign_partition(state, topic, %ProducerRecord{} = record) do
+  defp assign_partition(state, topic, metadata, %ProducerRecord{} = record) do
     entry = Map.fetch!(state.metadata_cache, topic)
-    metadata = entry.metadata
 
-    if metadata.partitions <= 0 do
-      {:error, "Topic #{metadata.name} has no partitions", state}
-    else
-      cond do
-        not is_nil(record.partition) ->
-          validate_explicit_partition(state, topic, record.partition, metadata)
+    cond do
+      metadata.partitions <= 0 ->
+        {:error, "Topic #{metadata.name} has no partitions", state}
 
-        valid_key?(record.key) ->
-          partition = :erlang.phash2(record.key, metadata.partitions)
-          {:ok, partition, state}
+      not is_nil(record.partition) ->
+        validate_explicit_partition(state, topic, record.partition, metadata)
 
-        true ->
-          partition = rem(entry.round_robin, metadata.partitions)
-          new_entry = %{entry | round_robin: entry.round_robin + 1}
-          new_state = %{state | metadata_cache: Map.put(state.metadata_cache, topic, new_entry)}
-          {:ok, partition, new_state}
-      end
+      valid_key?(record.key) ->
+        partition = :erlang.phash2(record.key, metadata.partitions)
+        {:ok, partition, state}
+
+      true ->
+        partition = rem(entry.round_robin, metadata.partitions)
+        new_entry = %{entry | round_robin: entry.round_robin + 1}
+        new_state = %{state | metadata_cache: Map.put(state.metadata_cache, topic, new_entry)}
+        {:ok, partition, new_state}
     end
   end
 
