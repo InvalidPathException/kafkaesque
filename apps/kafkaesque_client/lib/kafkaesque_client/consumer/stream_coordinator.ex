@@ -35,7 +35,7 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
     assignments: MapSet.new(),
     positions: %{},
     stream_tasks: %{},
-    paused: MapSet.new(),
+    paused: %{},
     restart_attempts: %{},
     restart_timers: %{}
   ]
@@ -94,17 +94,45 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
   @doc """
   Pauses the given partitions (streams are stopped but assignments retained).
   """
-  @spec pause(GenServer.server(), [TopicPartition.t()]) :: :ok
-  def pause(coordinator, partitions) do
-    GenServer.call(coordinator, {:pause, partitions})
+  @spec pause(GenServer.server(), [TopicPartition.t()], keyword()) :: :ok
+  def pause(coordinator, partitions, opts \\ []) do
+    reason = Keyword.get(opts, :reason, :manual)
+    GenServer.call(coordinator, {:pause, partitions, reason})
   end
 
   @doc """
   Resumes the given partitions using the stored offsets.
   """
-  @spec resume(GenServer.server(), [TopicPartition.t()]) :: :ok | {:error, term()}
-  def resume(coordinator, partitions) do
-    GenServer.call(coordinator, {:resume, partitions})
+  @spec resume(GenServer.server(), [TopicPartition.t()], keyword()) :: :ok | {:error, term()}
+  def resume(coordinator, partitions, opts \\ []) do
+    reason = Keyword.get(opts, :reason, :manual)
+    GenServer.call(coordinator, {:resume, partitions, reason})
+  end
+
+  @doc """
+  Convenience helper to pause partitions for coordinator-managed backpressure.
+  """
+  @spec pause_for_backpressure(GenServer.server(), [TopicPartition.t()]) :: :ok
+  def pause_for_backpressure(coordinator, partitions) do
+    pause(coordinator, partitions, reason: :backpressure)
+  end
+
+  @doc """
+  Convenience helper to resume partitions previously paused for backpressure.
+  """
+  @spec resume_from_backpressure(GenServer.server(), [TopicPartition.t()]) ::
+          :ok | {:error, term()}
+  def resume_from_backpressure(coordinator, partitions) do
+    resume(coordinator, partitions, reason: :backpressure)
+  end
+
+  @doc """
+  Applies rebalance changes by adding new partitions, revoking removed ones, and
+  updating starting offsets.
+  """
+  @spec rebalance(GenServer.server(), [TopicPartition.t()], [TopicPartition.t()], map()) :: :ok
+  def rebalance(coordinator, to_assign, to_revoke, positions) do
+    GenServer.call(coordinator, {:rebalance, to_assign, to_revoke, positions})
   end
 
   @doc """
@@ -163,11 +191,10 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
 
     state = stop_streams_not_in(state, assignments)
 
-    state = %{
+    state =
       state
-      | assignments: assignments,
-        paused: MapSet.intersection(state.paused, assignments)
-    }
+      |> Map.put(:assignments, assignments)
+      |> prune_paused(assignments)
 
     state =
       Enum.reduce(assignments, state, fn tp, acc ->
@@ -188,7 +215,7 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
 
     new_assignments = MapSet.difference(state.assignments, MapSet.new(partitions_to_drop))
     new_positions = Map.drop(state.positions, partitions_to_drop)
-    new_paused = MapSet.difference(state.paused, MapSet.new(partitions_to_drop))
+    new_paused = Map.drop(state.paused, partitions_to_drop)
 
     new_state = %{
       state
@@ -208,19 +235,65 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
     {:reply, :ok, %{state | positions: positions}}
   end
 
-  def handle_call({:pause, partitions}, _from, state) do
-    pause_set = MapSet.new(partitions)
-    state = Enum.reduce(partitions, state, &stop_partition_stream(&2, &1))
-    {:reply, :ok, %{state | paused: MapSet.union(state.paused, pause_set)}}
+  def handle_call({:pause, partitions, reason}, _from, state) do
+    state =
+      Enum.reduce(partitions, state, fn tp, acc ->
+        acc
+        |> stop_partition_stream(tp)
+        |> add_pause(tp, reason)
+      end)
+
+    {:reply, :ok, state}
   end
 
-  def handle_call({:resume, partitions}, _from, state) do
-    resume_set = MapSet.new(partitions)
-    state = %{state | paused: MapSet.difference(state.paused, resume_set)}
+  def handle_call({:resume, partitions, reason}, _from, state) do
+    state =
+      Enum.reduce(partitions, state, fn tp, acc ->
+        remove_pause(acc, tp, reason)
+      end)
 
     state =
       Enum.reduce(partitions, state, fn tp, acc ->
-        maybe_start_partition_stream(acc, tp, acc.positions)
+        if paused?(acc, tp) do
+          acc
+        else
+          maybe_start_partition_stream(acc, tp, acc.positions)
+        end
+      end)
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:rebalance, to_assign, to_revoke, positions}, _from, state) do
+    additions = Enum.uniq(to_assign)
+    removals = Enum.uniq(to_revoke)
+
+    add_set = MapSet.new(additions)
+    remove_set = MapSet.new(removals)
+
+    state = Enum.reduce(removals, state, &stop_partition_stream(&2, &1))
+
+    assignments =
+      state.assignments
+      |> MapSet.difference(remove_set)
+      |> MapSet.union(add_set)
+
+    positions =
+      state.positions
+      |> Map.drop(removals)
+      |> Map.merge(positions)
+      |> Map.take(MapSet.to_list(assignments))
+
+    state =
+      state
+      |> drop_pauses(removals)
+      |> Map.put(:assignments, assignments)
+      |> Map.put(:positions, positions)
+      |> prune_paused(assignments)
+
+    state =
+      Enum.reduce(additions, state, fn tp, acc ->
+        maybe_start_partition_stream(acc, tp, positions)
       end)
 
     {:reply, :ok, state}
@@ -251,7 +324,7 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
         assignments: MapSet.new(),
         positions: %{},
         subscriptions: MapSet.new(),
-        paused: MapSet.new(),
+        paused: %{},
         restart_attempts: %{},
         restart_timers: %{}
     }
@@ -291,7 +364,7 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
     state = cancel_restart_timer(state, tp, keep_attempt: true)
 
     state =
-      if MapSet.member?(state.assignments, tp) and not MapSet.member?(state.paused, tp) do
+      if MapSet.member?(state.assignments, tp) and not paused?(state, tp) do
         maybe_start_partition_stream(state, tp, state.positions)
       else
         cancel_restart_timer(state, tp)
@@ -361,7 +434,7 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
   defp maybe_start_partition_stream(state, tp, positions) do
     cond do
       not MapSet.member?(state.assignments, tp) -> state
-      MapSet.member?(state.paused, tp) -> state
+      paused?(state, tp) -> state
       Map.has_key?(state.stream_tasks, tp) -> state
       true -> start_partition_stream(state, tp, positions)
     end
@@ -447,7 +520,7 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
     state = stop_partition_stream(state, tp, keep_attempt: true)
 
     cond do
-      MapSet.member?(state.paused, tp) -> state
+      paused?(state, tp) -> state
       not MapSet.member?(state.assignments, tp) -> state
       true -> schedule_restart(state, tp)
     end
@@ -465,13 +538,16 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
   end
 
   defp stop_streams_not_in(state, desired_assignments) do
-    Enum.reduce(Map.keys(state.stream_tasks), state, fn tp, acc ->
-      if MapSet.member?(desired_assignments, tp) do
-        acc
-      else
-        stop_partition_stream(acc, tp)
-      end
-    end)
+    state =
+      Enum.reduce(Map.keys(state.stream_tasks), state, fn tp, acc ->
+        if MapSet.member?(desired_assignments, tp) do
+          acc
+        else
+          stop_partition_stream(acc, tp)
+        end
+      end)
+
+    prune_paused(state, desired_assignments)
   end
 
   defp get_latest_offset(state, topic, partition) do
@@ -523,5 +599,47 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinator do
       end
 
     %{state | restart_timers: timers, restart_attempts: attempts}
+  end
+
+  defp paused?(state, tp), do: Map.has_key?(state.paused, tp)
+
+  defp add_pause(state, tp, reason) do
+    reasons =
+      state.paused
+      |> Map.get(tp, MapSet.new())
+      |> MapSet.put(reason)
+
+    %{state | paused: Map.put(state.paused, tp, reasons)}
+  end
+
+  defp remove_pause(state, tp, :all), do: %{state | paused: Map.delete(state.paused, tp)}
+
+  defp remove_pause(state, tp, reason) do
+    case Map.get(state.paused, tp) do
+      nil ->
+        state
+
+      reasons ->
+        updated = MapSet.delete(reasons, reason)
+
+        if MapSet.size(updated) == 0 do
+          %{state | paused: Map.delete(state.paused, tp)}
+        else
+          %{state | paused: Map.put(state.paused, tp, updated)}
+        end
+    end
+  end
+
+  defp prune_paused(state, assignments) do
+    filtered =
+      state.paused
+      |> Enum.filter(fn {tp, _} -> MapSet.member?(assignments, tp) end)
+      |> Enum.into(%{})
+
+    %{state | paused: filtered}
+  end
+
+  defp drop_pauses(state, partitions) do
+    %{state | paused: Map.drop(state.paused, partitions)}
   end
 end

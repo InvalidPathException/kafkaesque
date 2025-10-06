@@ -124,17 +124,31 @@ defmodule KafkaesqueClient.Consumer do
   @doc """
   Pauses consumption from specific topic partitions.
   """
-  @spec pause(GenServer.server(), [TopicPartition.t()]) :: :ok
-  def pause(consumer, partitions) do
-    GenServer.call(consumer, {:pause, partitions})
+  @spec pause(GenServer.server(), [TopicPartition.t()], keyword()) :: :ok
+  def pause(consumer, partitions, opts \\ []) do
+    GenServer.call(consumer, {:pause, partitions, opts})
   end
 
   @doc """
   Resumes consumption from paused topic partitions.
   """
-  @spec resume(GenServer.server(), [TopicPartition.t()]) :: :ok
-  def resume(consumer, partitions) do
-    GenServer.call(consumer, {:resume, partitions})
+  @spec resume(GenServer.server(), [TopicPartition.t()], keyword()) :: :ok
+  def resume(consumer, partitions, opts \\ []) do
+    GenServer.call(consumer, {:resume, partitions, opts})
+  end
+
+  @doc """
+  Applies rebalance changes by adding and revoking partitions with optional
+  starting offsets.
+  """
+  @spec rebalance(
+          GenServer.server(),
+          [TopicPartition.t()],
+          [TopicPartition.t()],
+          map()
+        ) :: :ok
+  def rebalance(consumer, to_assign, to_revoke, positions \\ %{}) do
+    GenServer.call(consumer, {:rebalance, to_assign, to_revoke, positions})
   end
 
   @doc """
@@ -334,14 +348,73 @@ defmodule KafkaesqueClient.Consumer do
     {:reply, :ok, %{state | position: new_position}}
   end
 
-  def handle_call({:pause, partitions}, _from, state) do
-    :ok = StreamCoordinator.pause(state.stream_coordinator, partitions)
+  def handle_call({:pause, partitions, opts}, _from, state) do
+    :ok = StreamCoordinator.pause(state.stream_coordinator, partitions, opts)
     {:reply, :ok, state}
   end
 
-  def handle_call({:resume, partitions}, _from, state) do
-    :ok = StreamCoordinator.resume(state.stream_coordinator, partitions)
+  def handle_call({:resume, partitions, opts}, _from, state) do
+    :ok = StreamCoordinator.resume(state.stream_coordinator, partitions, opts)
     {:reply, :ok, state}
+  end
+
+  def handle_call({:rebalance, to_assign, to_revoke, positions}, _from, state) do
+    position_updates =
+      Enum.reduce(to_assign, positions, fn tp, acc ->
+        Map.put_new(acc, tp, determine_initial_offset(state, tp))
+      end)
+
+    :ok =
+      StreamCoordinator.rebalance(
+        state.stream_coordinator,
+        to_assign,
+        to_revoke,
+        position_updates
+      )
+
+    removal_set = MapSet.new(to_revoke)
+
+    assignments =
+      state.assignments
+      |> MapSet.new()
+      |> MapSet.difference(removal_set)
+      |> MapSet.union(MapSet.new(to_assign))
+      |> Enum.to_list()
+      |> Enum.sort_by(fn %TopicPartition{topic: topic, partition: partition} ->
+        {topic, partition}
+      end)
+
+    base_positions = Map.drop(state.position, to_revoke)
+
+    new_position =
+      assignments
+      |> Enum.reduce(base_positions, fn tp, acc ->
+        cond do
+          Map.has_key?(position_updates, tp) -> Map.put(acc, tp, position_updates[tp])
+          Map.has_key?(acc, tp) -> acc
+          true -> Map.put(acc, tp, determine_initial_offset(state, tp))
+        end
+      end)
+
+    removal_lookup = MapSet.new(to_revoke)
+
+    new_buffer =
+      state.buffer
+      |> :queue.to_list()
+      |> Enum.reject(fn %ConsumerRecord{topic: topic, partition: partition} ->
+        MapSet.member?(removal_lookup, %TopicPartition{topic: topic, partition: partition})
+      end)
+      |> Enum.reduce(:queue.new(), fn record, acc -> :queue.in(record, acc) end)
+
+    :ok = StreamCoordinator.update_positions(state.stream_coordinator, new_position)
+
+    {:reply, :ok,
+     %{
+       state
+       | assignments: assignments,
+         position: new_position,
+         buffer: new_buffer
+     }}
   end
 
   def handle_call(:close, _from, state) do

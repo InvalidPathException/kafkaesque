@@ -120,22 +120,22 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinatorTest do
 
     state =
       eventually(coordinator, fn state ->
-        MapSet.member?(state.paused, tp) and
+        paused?(state, tp) and
           not Map.has_key?(state.restart_timers, tp) and
           Map.get(state.restart_attempts, tp) == nil
       end)
 
-    assert MapSet.member?(state.paused, tp)
+    assert paused?(state, tp)
 
     :ok = StreamCoordinator.resume(coordinator, [tp])
 
     resume_state =
       eventually(coordinator, fn resume_state ->
-        not MapSet.member?(resume_state.paused, tp) and
+        not paused?(resume_state, tp) and
           Map.get(resume_state.restart_attempts, tp, 0) >= 1
       end)
 
-    refute MapSet.member?(resume_state.paused, tp)
+    refute paused?(resume_state, tp)
   end
 
   test "unsubscribe clears assignments, positions, and cached metadata", %{
@@ -160,7 +160,7 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinatorTest do
       end)
 
     assert MapSet.equal?(state.subscriptions, MapSet.new())
-    assert MapSet.equal?(state.paused, MapSet.new())
+    assert state.paused == %{}
   end
 
   test "repeated stream errors increase restart attempts", %{coordinator: coordinator} do
@@ -177,6 +177,57 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinatorTest do
     assert Map.get(state.restart_attempts, tp, 0) >= 2
   end
 
+  test "pause reasons stack and resume clears selectively", %{coordinator: coordinator} do
+    tp = TopicPartition.new("topic-pauses", 0)
+
+    :ok = StreamCoordinator.assign(coordinator, [tp], %{tp => 0})
+    eventually(coordinator, fn state -> MapSet.member?(state.assignments, tp) end)
+
+    :ok = StreamCoordinator.pause(coordinator, [tp])
+    :ok = StreamCoordinator.pause(coordinator, [tp], reason: :backpressure)
+
+    state = eventually(coordinator, fn state -> paused?(state, tp) end)
+    assert MapSet.equal?(Map.fetch!(state.paused, tp), MapSet.new([:manual, :backpressure]))
+
+    :ok = StreamCoordinator.resume(coordinator, [tp])
+
+    state =
+      eventually(coordinator, fn state ->
+        paused?(state, tp) and
+          MapSet.equal?(Map.fetch!(state.paused, tp), MapSet.new([:backpressure]))
+      end)
+
+    :ok = StreamCoordinator.resume_from_backpressure(coordinator, [tp])
+
+    state = eventually(coordinator, fn state -> not paused?(state, tp) end)
+    refute paused?(state, tp)
+  end
+
+  test "rebalance updates assignments and drops revoked partitions", %{
+    coordinator: coordinator,
+    topic: topic
+  } do
+    tp0 = TopicPartition.new(topic, 0)
+    tp1 = TopicPartition.new(topic, 1)
+
+    :ok = StreamCoordinator.assign(coordinator, [tp0], %{tp0 => 4})
+    eventually(coordinator, fn state -> Map.get(state.positions, tp0) == 4 end)
+
+    :ok = StreamCoordinator.pause(coordinator, [tp0])
+
+    :ok = StreamCoordinator.rebalance(coordinator, [tp1], [tp0], %{tp1 => 12})
+
+    state =
+      eventually(coordinator, fn state ->
+        MapSet.member?(state.assignments, tp1) and
+          not MapSet.member?(state.assignments, tp0) and
+          Map.get(state.positions, tp1) == 12
+      end)
+
+    refute paused?(state, tp0)
+    refute Map.has_key?(state.positions, tp0)
+  end
+
   defp eventually(coordinator, predicate, attempts \\ 50)
 
   defp eventually(_coordinator, _predicate, 0), do: flunk("condition not met in time")
@@ -191,4 +242,6 @@ defmodule KafkaesqueClient.Consumer.StreamCoordinatorTest do
       eventually(coordinator, predicate, attempts - 1)
     end
   end
+
+  defp paused?(state, tp), do: Map.has_key?(state.paused, tp)
 end
