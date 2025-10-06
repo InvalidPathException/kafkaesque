@@ -2,14 +2,16 @@ defmodule KafkaesqueServer.RecordController do
   use Phoenix.Controller, formats: [:json, :html]
 
   alias Kafkaesque.Offsets.DetsOffset
+  alias Kafkaesque.Partition.Router
   alias Kafkaesque.Pipeline.Producer
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Topic.LogReader
+  alias Kafkaesque.Topic.Supervisor, as: TopicSupervisor
 
   require Logger
 
   def produce(conn, %{"topic" => topic} = params) do
-    partition = Map.get(params, "partition", 0)
+    partition_param = params |> Map.get("partition") |> normalize_partition_param()
     records = Map.get(params, "records", [])
     acks = Map.get(params, "acks", "leader")
 
@@ -18,51 +20,63 @@ defmodule KafkaesqueServer.RecordController do
       |> put_status(:bad_request)
       |> json(%{error: "Records are required"})
     else
-      Logger.info("REST: Producing #{length(records)} records to #{topic}/#{partition}")
-
-      # Convert JSON records to internal format
-      messages =
-        Enum.map(records, fn record ->
-          %{
-            key: Map.get(record, "key", <<>>),
-            value: Map.get(record, "value", <<>>),
-            headers: Map.get(record, "headers", []) |> convert_headers(),
-            timestamp_ms: Map.get(record, "timestamp_ms", System.system_time(:millisecond))
-          }
-        end)
-
-      # Determine acks level
-      acks_atom =
-        case acks do
-          "none" -> :none
-          _ -> :leader
-        end
-
-      case Producer.produce(topic, partition, messages, acks: acks_atom) do
-        {:ok, result} ->
-          json(conn, %{
-            topic: topic,
-            partition: partition,
-            base_offset: Map.get(result, :base_offset, 0),
-            count: result.count,
-            status: "success"
-          })
-
-        {:error, :backpressure} ->
+      case TopicSupervisor.get_topic_info(topic) do
+        {:error, :topic_not_found} ->
           conn
-          |> put_status(:too_many_requests)
-          |> json(%{error: "Producer queue is full, please retry"})
+          |> put_status(:not_found)
+          |> json(%{error: "Topic #{topic} does not exist"})
 
-        {:error, reason} ->
-          conn
-          |> put_status(:internal_server_error)
-          |> json(%{error: "Failed to produce: #{inspect(reason)}"})
+        {:ok, topic_info} ->
+          routing_key = records |> first_json_key() |> coerce_routing_key()
+
+          case resolve_produce_partition(topic_info, partition_param, routing_key) do
+            {:ok, partition} ->
+              Logger.info("REST: Producing #{length(records)} records to #{topic}/#{partition}")
+
+              messages =
+                Enum.map(records, fn record ->
+                  %{
+                    key: Map.get(record, "key", <<>>),
+                    value: Map.get(record, "value", <<>>),
+                    headers: Map.get(record, "headers", []) |> convert_headers(),
+                    timestamp_ms: Map.get(record, "timestamp_ms", System.system_time(:millisecond))
+                  }
+                end)
+
+              acks_atom = if acks == "none", do: :none, else: :leader
+
+              case Producer.produce(topic, partition, messages, acks: acks_atom) do
+                {:ok, result} ->
+                  json(conn, %{
+                    topic: topic,
+                    partition: partition,
+                    base_offset: Map.get(result, :base_offset, 0),
+                    count: result.count,
+                    status: "success"
+                  })
+
+                {:error, :backpressure} ->
+                  conn
+                  |> put_status(:too_many_requests)
+                  |> json(%{error: "Producer queue is full, please retry"})
+
+                {:error, reason} ->
+                  conn
+                  |> put_status(:internal_server_error)
+                  |> json(%{error: "Failed to produce: #{inspect(reason)}"})
+              end
+
+            {:error, message} ->
+              conn
+              |> put_status(:bad_request)
+              |> json(%{error: message})
+          end
       end
     end
   end
 
   def consume(conn, %{"topic" => topic} = params) do
-    partition = Map.get(params, "partition", 0)
+    partition_param = params |> Map.get("partition") |> normalize_partition_param()
     group = Map.get(params, "group", "")
     offset = Map.get(params, "offset", "-1") |> parse_offset()
     format = Map.get(params, "format", "json")
@@ -74,85 +88,90 @@ defmodule KafkaesqueServer.RecordController do
         max_wait_ms = validated_params.max_wait_ms
         auto_commit = validated_params.auto_commit
 
-        Logger.info("REST: Consuming from #{topic}/#{partition} for group #{group}")
+        case TopicSupervisor.get_topic_info(topic) do
+          {:error, :topic_not_found} ->
+            conn
+            |> put_status(:not_found)
+            |> json(%{error: "Topic #{topic} does not exist"})
 
-        # Get starting offset
-        starting_offset =
-          if group != "" do
-            case DetsOffset.fetch(topic, partition, group) do
-              {:ok, committed_offset} -> committed_offset + 1
-              {:error, :not_found} -> offset
-              _ -> offset
-            end
-          else
-            offset
-          end
+          {:ok, topic_info} ->
+            case resolve_consume_partition(topic_info, partition_param) do
+              {:ok, partition} ->
+                Logger.info("REST: Consuming from #{topic}/#{partition} for group #{group}")
 
-        if format == "sse" do
-          # Server-Sent Events for streaming
-          conn
-          |> put_resp_header("content-type", "text/event-stream")
-          |> put_resp_header("cache-control", "no-cache")
-          |> send_chunked(200)
-          |> sse_consume_loop(
-            topic,
-            partition,
-            group,
-            starting_offset,
-            max_bytes,
-            max_wait_ms,
-            auto_commit
-          )
-        else
-          # Single fetch for JSON response
-          try do
-            case LogReader.consume(topic, partition, group, starting_offset, max_bytes, max_wait_ms) do
-              {:ok, records} ->
-                # Auto-commit if enabled
-                if auto_commit and group != "" and records != [] do
-                  last_offset = starting_offset + length(records) - 1
-                  DetsOffset.commit(topic, partition, group, last_offset)
+                starting_offset =
+                  if group != "" do
+                    case DetsOffset.fetch(topic, partition, group) do
+                      {:ok, committed_offset} -> committed_offset + 1
+                      {:error, :not_found} -> offset
+                      _ -> offset
+                    end
+                  else
+                    offset
+                  end
+
+                if format == "sse" do
+                  conn
+                  |> put_resp_header("content-type", "text/event-stream")
+                  |> put_resp_header("cache-control", "no-cache")
+                  |> send_chunked(200)
+                  |> sse_consume_loop(
+                    topic,
+                    partition,
+                    group,
+                    starting_offset,
+                    max_bytes,
+                    max_wait_ms,
+                    auto_commit
+                  )
+                else
+                  try do
+                    case LogReader.consume(topic, partition, group, starting_offset, max_bytes, max_wait_ms) do
+                      {:ok, records} ->
+                        if auto_commit and group != "" and records != [] do
+                          last_offset = starting_offset + length(records) - 1
+                          DetsOffset.commit(topic, partition, group, last_offset)
+                        end
+
+                        {_, high_watermark} =
+                          case SingleFile.get_offsets(topic, partition) do
+                            {:ok, %{latest: hw}} -> {0, hw}
+                            _ -> {0, starting_offset}
+                          end
+
+                        actual_base_offset =
+                          case starting_offset do
+                            :earliest -> 0
+                            :latest -> if records == [], do: high_watermark, else: List.first(records)[:offset] || 0
+                            n when is_integer(n) -> n
+                          end
+
+                        json(conn, %{
+                          topic: topic,
+                          partition: partition,
+                          high_watermark: high_watermark,
+                          base_offset: actual_base_offset,
+                          records: Enum.map(records, &format_record/1)
+                        })
+
+                      {:error, reason} ->
+                        conn
+                        |> put_status(:internal_server_error)
+                        |> json(%{error: "Failed to consume: #{inspect(reason)}"})
+                    end
+                  catch
+                    :exit, {:noproc, _} ->
+                      conn
+                      |> put_status(:internal_server_error)
+                      |> json(%{error: "Failed to consume: topic or partition does not exist"})
+                  end
                 end
 
-                # Get high watermark
-                {_, high_watermark} =
-                  case SingleFile.get_offsets(topic, partition) do
-                    {:ok, %{latest: hw}} -> {0, hw}
-                    _ -> {0, starting_offset}
-                  end
-
-                # Determine actual base offset for response
-                actual_base_offset =
-                  case starting_offset do
-                    :earliest ->
-                      0
-
-                    :latest ->
-                      if records == [], do: high_watermark, else: List.first(records)[:offset] || 0
-
-                    n when is_integer(n) ->
-                      n
-                  end
-
-                json(conn, %{
-                  topic: topic,
-                  partition: partition,
-                  high_watermark: high_watermark,
-                  base_offset: actual_base_offset,
-                  records: Enum.map(records, &format_record/1)
-                })
-
-              {:error, reason} ->
+              {:error, message} ->
                 conn
-                |> put_status(:internal_server_error)
-                |> json(%{error: "Failed to consume: #{inspect(reason)}"})
+                |> put_status(:bad_request)
+                |> json(%{error: message})
             end
-          catch
-            :exit, {:noproc, _} ->
-              conn
-              |> put_status(:internal_server_error)
-              |> json(%{error: "Failed to consume: topic or partition does not exist"})
-          end
         end
 
       {:error, error_msg} ->
@@ -163,6 +182,56 @@ defmodule KafkaesqueServer.RecordController do
   end
 
   # Private functions
+
+  defp normalize_partition_param(nil), do: -1
+  defp normalize_partition_param(partition) when is_integer(partition), do: partition
+
+  defp normalize_partition_param(partition) when is_binary(partition) do
+    case Integer.parse(partition) do
+      {value, ""} -> value
+      _ -> -1
+    end
+  end
+
+  defp normalize_partition_param(_), do: -1
+
+  defp resolve_produce_partition(topic_info, partition, routing_key) when partition < 0 do
+    {:ok, Router.route(routing_key, topic_info.partitions)}
+  end
+
+  defp resolve_produce_partition(topic_info, partition, _routing_key) do
+    if partition in topic_info.partition_ids do
+      {:ok, partition}
+    else
+      {:error,
+       "Invalid partition #{partition} for topic #{topic_info.name} (available: #{Enum.join(topic_info.partition_ids, ", ")})"}
+    end
+  end
+
+  defp resolve_consume_partition(topic_info, partition) when partition < 0 do
+    case topic_info.partition_ids do
+      [first | _] -> {:ok, first}
+      _ -> {:error, "Topic #{topic_info.name} has no partitions"}
+    end
+  end
+
+  defp resolve_consume_partition(topic_info, partition) do
+    if partition in topic_info.partition_ids do
+      {:ok, partition}
+    else
+      {:error,
+       "Invalid partition #{partition} for topic #{topic_info.name} (available: #{Enum.join(topic_info.partition_ids, ", ")})"}
+    end
+  end
+
+  defp first_json_key([]), do: nil
+  defp first_json_key(nil), do: nil
+  defp first_json_key([record | _]) when is_map(record), do: Map.get(record, "key")
+  defp first_json_key(record) when is_map(record), do: Map.get(record, "key")
+  defp first_json_key(_), do: nil
+
+  defp coerce_routing_key(key) when is_binary(key) and byte_size(key) > 0, do: key
+  defp coerce_routing_key(_), do: nil
 
   defp validate_consume_params(params) do
     max_bytes = Map.get(params, "max_bytes", "1048576") |> String.to_integer()

@@ -67,6 +67,43 @@ defmodule KafkaesqueServer.RecordControllerTest do
       assert response["error"] == "Records are required"
     end
 
+    test "routes to hashed partition when partition not provided" do
+      {:ok, topic, _} =
+        Helpers.create_test_topic(name: Factory.unique_topic_name("rest_auto"), partitions: 3)
+
+      on_exit(fn -> Helpers.delete_test_topic(topic) end)
+
+      key = "customer-123"
+      expected_partition = :erlang.phash2(key, 3)
+
+      conn = conn(:post, "/v1/topics/#{topic}/records", %{})
+      |> put_req_header("content-type", "application/json")
+
+      conn = RecordController.produce(conn, %{
+        "topic" => topic,
+        "records" => [%{"key" => key, "value" => "value"}]
+      })
+
+      assert conn.status == 200
+      response = Jason.decode!(conn.resp_body)
+      assert response["partition"] == expected_partition
+    end
+
+    test "returns error for out-of-range partition", %{topic: topic} do
+      conn = conn(:post, "/v1/topics/#{topic}/records", %{})
+      |> put_req_header("content-type", "application/json")
+
+      conn = RecordController.produce(conn, %{
+        "topic" => topic,
+        "partition" => 99,
+        "records" => [%{"key" => "k", "value" => "v"}]
+      })
+
+      assert conn.status == 400
+      response = Jason.decode!(conn.resp_body)
+      assert response["error"] =~ "Invalid partition"
+    end
+
     test "handles records with headers", %{topic: topic} do
       conn = conn(:post, "/v1/topics/#{topic}/records", %{})
       |> put_req_header("content-type", "application/json")
@@ -316,15 +353,15 @@ defmodule KafkaesqueServer.RecordControllerTest do
       assert Map.has_key?(first_record, "offset")
     end
 
-    test "handles consume errors gracefully", %{topic: _topic} do
+    test "returns 404 when consuming from unknown topic" do
       conn = RecordController.consume(
         conn(:get, "/v1/topics/non-existent/records"),
         %{"topic" => "non-existent"}
       )
 
-      assert conn.status == 500
+      assert conn.status == 404
       response = Jason.decode!(conn.resp_body)
-      assert response["error"] =~ "Failed to consume"
+      assert response["error"] =~ "Topic non-existent does not exist"
     end
   end
 

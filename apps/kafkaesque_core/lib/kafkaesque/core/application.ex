@@ -8,6 +8,7 @@ defmodule Kafkaesque.Core.Application do
     children = [
       {Registry, keys: :unique, name: Kafkaesque.TopicRegistry},
       Kafkaesque.Topic.Metadata,
+      Kafkaesque.Partition.Router,
       Kafkaesque.Topic.Supervisor,
       {Phoenix.PubSub, name: Kafkaesque.PubSub, adapter: Phoenix.PubSub.PG2},
       Kafkaesque.Telemetry.Supervisor,

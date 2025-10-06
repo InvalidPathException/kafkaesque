@@ -167,6 +167,26 @@ defmodule Kafkaesque.Integration.GRPCServiceTest do
       assert result.base_offset >= 0
     end
 
+    test "auto partition routes using record key" do
+      {:ok, topic, _} =
+        Helpers.create_test_topic(name: Factory.unique_topic_name("auto_route"), partitions: 3)
+
+      on_exit(fn -> Helpers.delete_test_topic(topic) end)
+
+      key = "customer-42"
+      expected_partition = :erlang.phash2(key, 3)
+
+      request = %ProduceRequest{
+        topic: topic,
+        partition: -1,
+        records: [%Record{key: key, value: "value"}],
+        acks: :ACKS_LEADER
+      }
+
+      result = Service.produce(request, nil)
+      assert result.partition == expected_partition
+    end
+
     test "uses partition 0 when negative partition specified", %{topic: topic} do
       request = %ProduceRequest{
         topic: topic,
@@ -201,6 +221,17 @@ defmodule Kafkaesque.Integration.GRPCServiceTest do
       }
       result_leader = Service.produce(request_leader, nil)
       assert result_leader.count == 1
+    end
+
+    test "raises error when partition is out of range", %{topic: topic} do
+      request = %ProduceRequest{
+        topic: topic,
+        partition: 99,
+        records: [%Record{key: "k", value: "v"}],
+        acks: :ACKS_LEADER
+      }
+
+      assert_raise GRPC.RPCError, fn -> Service.produce(request, nil) end
     end
 
     test "raises error on backpressure", %{topic: topic} do

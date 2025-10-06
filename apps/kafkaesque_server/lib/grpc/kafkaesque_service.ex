@@ -27,6 +27,7 @@ defmodule Kafkaesque.GRPC.Service do
   }
 
   alias Kafkaesque.Offsets.DetsOffset
+  alias Kafkaesque.Partition.Router
   alias Kafkaesque.Pipeline.Producer
   alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Topic.LogReader
@@ -115,58 +116,59 @@ defmodule Kafkaesque.GRPC.Service do
   Produces records to a topic partition.
   """
   def produce(%ProduceRequest{} = request, _stream) do
-    Logger.info("gRPC: Producing to #{request.topic}/#{request.partition}")
+    topic = request.topic
 
-    # Validate topic name
-    if request.topic == nil or request.topic == "" do
+    if topic == nil or topic == "" do
       raise GRPC.RPCError,
         status: :invalid_argument,
         message: "Topic name is required"
     end
 
-    # MVP: Always use partition 0 if not specified
-    partition = if request.partition < 0, do: 0, else: request.partition
-
-    # Check if topic exists
-    case TopicSupervisor.get_topic_info(request.topic) do
+    case TopicSupervisor.get_topic_info(topic) do
       {:error, :topic_not_found} ->
         raise GRPC.RPCError,
           status: :not_found,
-          message: "Topic #{request.topic} does not exist"
+          message: "Topic #{topic} does not exist"
 
-      _ ->
-        :ok
-    end
+      {:ok, topic_info} ->
+        case resolve_produce_partition(request, topic_info) do
+          {:ok, partition} ->
+            Logger.info("gRPC: Producing to #{topic}/#{partition}")
 
-    # Convert protobuf records to internal format
-    messages = Enum.map(request.records, &convert_record_to_internal/1)
+            messages = Enum.map(request.records, &convert_record_to_internal/1)
 
-    # Determine acks level
-    acks =
-      case request.acks do
-        :ACKS_NONE -> :none
-        :ACKS_LEADER -> :leader
-        _ -> :leader
-      end
+            acks =
+              case request.acks do
+                :ACKS_NONE -> :none
+                :ACKS_LEADER -> :leader
+                _ -> :leader
+              end
 
-    case Producer.produce(request.topic, partition, messages, acks: acks) do
-      {:ok, result} ->
-        %ProduceResponse{
-          topic: request.topic,
-          partition: partition,
-          base_offset: Map.get(result, :base_offset, 0),
-          count: result.count
-        }
+            case Producer.produce(topic, partition, messages, acks: acks) do
+              {:ok, result} ->
+                %ProduceResponse{
+                  topic: topic,
+                  partition: partition,
+                  base_offset: Map.get(result, :base_offset, 0),
+                  count: result.count
+                }
 
-      {:error, :backpressure} ->
-        raise GRPC.RPCError,
-          status: :resource_exhausted,
-          message: "Producer queue is full, please retry"
+              {:error, :backpressure} ->
+                raise GRPC.RPCError,
+                  status: :resource_exhausted,
+                  message: "Producer queue is full, please retry"
 
-      {:error, reason} ->
-        raise GRPC.RPCError,
-          status: :internal,
-          message: "Failed to produce: #{inspect(reason)}"
+              {:error, reason} ->
+                raise GRPC.RPCError,
+                  status: :internal,
+                  message: "Failed to produce: #{inspect(reason)}"
+            end
+
+          {:error, {:invalid_partition, partition, total}} ->
+            raise GRPC.RPCError,
+              status: :invalid_argument,
+              message: "Invalid partition #{partition} for topic with #{total} partitions"
+        end
     end
   end
 
@@ -174,12 +176,20 @@ defmodule Kafkaesque.GRPC.Service do
   Consumes records from a topic partition as a streaming response.
   """
   def consume(%ConsumeRequest{} = request, stream) do
-    Logger.info(
-      "gRPC: Consuming from #{request.topic}/#{request.partition} for group #{request.group}"
-    )
+    partition =
+      case TopicSupervisor.get_topic_info(request.topic) do
+        {:error, :topic_not_found} ->
+          raise GRPC.RPCError,
+            status: :not_found,
+            message: "Topic #{request.topic} does not exist"
 
-    # MVP: Always use partition 0 if not specified
-    partition = if request.partition < 0, do: 0, else: request.partition
+        {:ok, topic_info} ->
+          resolve_consume_partition(request.partition, topic_info)
+      end
+
+    Logger.info(
+      "gRPC: Consuming from #{request.topic}/#{partition} for group #{request.group}"
+    )
 
     # Determine starting offset
     offset =
@@ -288,6 +298,42 @@ defmodule Kafkaesque.GRPC.Service do
       timestamp_ms: record[:timestamp_ms] || 0
     }
   end
+
+  defp resolve_produce_partition(%ProduceRequest{partition: -1, records: records}, topic_info) do
+    key = first_record_key(records)
+    {:ok, Router.route(key, topic_info.partitions)}
+  end
+
+  defp resolve_produce_partition(%ProduceRequest{partition: partition}, topic_info) do
+    if partition in topic_info.partition_ids do
+      {:ok, partition}
+    else
+      {:error, {:invalid_partition, partition, topic_info.partitions}}
+    end
+  end
+
+  defp resolve_consume_partition(partition, topic_info) when partition < 0 do
+    case topic_info.partition_ids do
+      [first | _] -> first
+      _ -> 0
+    end
+  end
+
+  defp resolve_consume_partition(partition, topic_info) do
+    if Enum.member?(topic_info.partition_ids, partition) do
+      partition
+    else
+      raise GRPC.RPCError,
+        status: :invalid_argument,
+        message: "Invalid partition #{partition} for topic with #{topic_info.partitions} partitions"
+    end
+  end
+
+  defp first_record_key([]), do: nil
+  defp first_record_key(nil), do: nil
+
+  defp first_record_key([%Record{key: key} | _]) when is_binary(key) and byte_size(key) > 0, do: key
+  defp first_record_key([_ | _]), do: nil
 
   defp consume_loop(stream, topic, partition, group, offset, max_bytes, max_wait_ms, auto_commit) do
     consume_loop_with_state(
