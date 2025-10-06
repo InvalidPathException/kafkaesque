@@ -78,6 +78,10 @@ defmodule Kafkaesque.Storage.SingleFile do
     GenServer.call(via_tuple(topic, partition), :get_offsets)
   end
 
+  def get_stats(topic, partition) do
+    GenServer.call(via_tuple(topic, partition), :get_stats)
+  end
+
   def close(topic, partition) do
     GenServer.call(via_tuple(topic, partition), :close)
   end
@@ -242,6 +246,17 @@ defmodule Kafkaesque.Storage.SingleFile do
     }
 
     {:reply, {:ok, offsets}, state}
+  end
+
+  @impl true
+  def handle_call(:get_stats, _from, state) do
+    stats = %{
+      earliest_offset: 0,
+      latest_offset: if(state.current_offset == 0, do: -1, else: state.current_offset - 1),
+      size_bytes: state.current_position
+    }
+
+    {:reply, {:ok, stats}, state}
   end
 
   @impl true

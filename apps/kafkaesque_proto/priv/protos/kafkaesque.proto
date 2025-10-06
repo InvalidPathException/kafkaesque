@@ -91,6 +91,28 @@ message GetOffsetsResponse {
   int64 latest = 2;
 }
 
+// Describe topic request
+message DescribeTopicRequest {
+  string topic = 1;
+}
+
+// Per-partition metadata
+message PartitionInfo {
+  int32 partition = 1;
+  int64 earliest_offset = 2;
+  int64 latest_offset = 3;
+  int64 size_bytes = 4;
+}
+
+// Describe topic response
+message DescribeTopicResponse {
+  string topic = 1;
+  int32 partitions = 2;
+  int64 retention_hours = 3;
+  int64 created_at_ms = 4;
+  repeated PartitionInfo partition_infos = 5;
+}
+
 // Create topic request
 message CreateTopicRequest {
   string name = 1;
@@ -121,4 +143,5 @@ service Kafkaesque {
   rpc Consume(ConsumeRequest) returns (stream FetchedBatch);
   rpc CommitOffsets(CommitOffsetsRequest) returns (CommitOffsetsResponse);
   rpc GetOffsets(GetOffsetsRequest) returns (GetOffsetsResponse);
+  rpc DescribeTopic(DescribeTopicRequest) returns (DescribeTopicResponse);
 }

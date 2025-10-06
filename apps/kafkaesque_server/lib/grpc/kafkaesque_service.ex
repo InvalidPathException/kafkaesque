@@ -11,11 +11,14 @@ defmodule Kafkaesque.GRPC.Service do
     CommitOffsetsResponse,
     ConsumeRequest,
     CreateTopicRequest,
+    DescribeTopicRequest,
+    DescribeTopicResponse,
     FetchedBatch,
     GetOffsetsRequest,
     GetOffsetsResponse,
     ListTopicsRequest,
     ListTopicsResponse,
+    PartitionInfo,
     ProduceRequest,
     ProduceResponse,
     Record,
@@ -54,6 +57,37 @@ defmodule Kafkaesque.GRPC.Service do
         raise GRPC.RPCError,
           status: :internal,
           message: "Failed to create topic: #{inspect(reason)}"
+    end
+  end
+
+  @doc """
+  Describes a topic and its partitions.
+  """
+  def describe_topic(%DescribeTopicRequest{topic: topic}, _stream) do
+    Logger.info("gRPC: Describing topic #{topic}")
+
+    case TopicSupervisor.describe_topic(topic) do
+      {:ok, info} ->
+        partition_infos =
+          Enum.map(info.partition_infos, fn partition_info ->
+            %PartitionInfo{
+              partition: partition_info.partition,
+              earliest_offset: partition_info.earliest_offset,
+              latest_offset: partition_info.latest_offset,
+              size_bytes: partition_info.size_bytes
+            }
+          end)
+
+        %DescribeTopicResponse{
+          topic: info.name,
+          partitions: info.partitions,
+          retention_hours: info.retention_hours || 0,
+          created_at_ms: info.created_at_ms || 0,
+          partition_infos: partition_infos
+        }
+
+      {:error, :topic_not_found} ->
+        raise GRPC.RPCError, status: :not_found, message: "Topic #{topic} does not exist"
     end
   end
 

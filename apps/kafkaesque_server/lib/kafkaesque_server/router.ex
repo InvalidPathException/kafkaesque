@@ -15,6 +15,7 @@ defmodule KafkaesqueServer.Router do
     # Topics
     post "/topics", TopicController, :create
     get "/topics", TopicController, :index
+    get "/topics/:topic", TopicController, :show
 
     # Records
     post "/topics/:topic/records", RecordController, :produce

@@ -216,4 +216,23 @@ defmodule Kafkaesque.Topic.SupervisorTest do
       assert Process.alive?(new_pid)
     end
   end
+
+  describe "describe_topic/1" do
+    test "returns detailed metadata for a topic" do
+      topic_name = unique_topic_name("describe")
+      partitions = 2
+
+      assert {:ok, _topic} = TopicSupervisor.create_topic(topic_name, partitions)
+
+      assert {:ok, info} = TopicSupervisor.describe_topic(topic_name)
+      assert info.name == topic_name
+      assert info.partitions == partitions
+      assert is_integer(info.created_at_ms)
+      assert info.created_at_ms > 0
+      assert info.retention_hours >= 0
+
+      assert length(info.partition_infos) == partitions
+      assert Enum.map(info.partition_infos, & &1.partition) == Enum.to_list(0..(partitions - 1))
+    end
+  end
 end

@@ -7,7 +7,9 @@ defmodule Kafkaesque.Topic.Supervisor do
   use DynamicSupervisor
   require Logger
 
+  alias Kafkaesque.Storage.SingleFile
   alias Kafkaesque.Telemetry
+  alias Kafkaesque.Topic.Metadata
 
   def start_link(init_arg) do
     DynamicSupervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
@@ -35,8 +37,25 @@ defmodule Kafkaesque.Topic.Supervisor do
       nil ->
         # Emit telemetry
         Telemetry.topic_created(name, partitions)
+        created_at_ms = System.system_time(:millisecond)
+        retention_hours = Application.get_env(:kafkaesque_core, :retention_hours, 168)
+
+        Metadata.put(name, %{
+          partitions: partitions,
+          partition_ids: Enum.to_list(0..(partitions - 1)),
+          retention_hours: retention_hours,
+          created_at_ms: created_at_ms
+        })
+
         Logger.debug("Topic created: #{name} with #{partitions} partitions")
-        {:ok, %{topic: name, partitions: partitions}}
+        {:ok,
+         %{
+           topic: name,
+           partitions: partitions,
+           partition_ids: Enum.to_list(0..(partitions - 1)),
+           retention_hours: retention_hours,
+           created_at_ms: created_at_ms
+         }}
 
       {:error, reason} ->
         # Clean up any successfully started partitions
@@ -113,6 +132,8 @@ defmodule Kafkaesque.Topic.Supervisor do
     # Emit telemetry
     Telemetry.topic_deleted(name)
 
+    Metadata.delete(name)
+
     Logger.debug("Topic deleted: #{name}")
 
     :ok
@@ -140,19 +161,42 @@ defmodule Kafkaesque.Topic.Supervisor do
   Gets information about a specific topic.
   """
   def get_topic_info(name) do
+    default_retention = Application.get_env(:kafkaesque_core, :retention_hours, 168)
+
     case find_topic_partitions(name) do
       [] ->
         {:error, :topic_not_found}
 
       partitions ->
+        metadata =
+          case Metadata.get(name) do
+            {:ok, attrs} -> attrs
+            {:error, :not_found} -> %{}
+          end
+
         info = %{
           name: name,
           partitions: length(partitions),
           partition_ids: Enum.sort(partitions),
-          status: :active
+          status: :active,
+          retention_hours: Map.get(metadata, :retention_hours, default_retention),
+          created_at_ms: Map.get(metadata, :created_at_ms)
         }
 
         {:ok, info}
+    end
+  end
+
+  @doc """
+  Returns detailed information about a topic, including per-partition metrics.
+  """
+  def describe_topic(name) do
+    with {:ok, info} <- get_topic_info(name) do
+      partition_infos =
+        info.partition_ids
+        |> Enum.map(&build_partition_info(name, &1))
+
+      {:ok, Map.put(info, :partition_infos, partition_infos)}
     end
   end
 
@@ -191,6 +235,32 @@ defmodule Kafkaesque.Topic.Supervisor do
     Registry.select(Kafkaesque.TopicRegistry, [
       {{{:partition_sup, :"$1", :"$2"}, :_, :_}, [{:==, :"$1", topic}], [:"$2"]}
     ])
+  end
+
+  defp build_partition_info(topic, partition) do
+    case SingleFile.get_stats(topic, partition) do
+      {:ok, stats} ->
+        %{
+          partition: partition,
+          earliest_offset: Map.get(stats, :earliest_offset, 0),
+          latest_offset: Map.get(stats, :latest_offset, -1),
+          size_bytes: Map.get(stats, :size_bytes, 0)
+        }
+
+      {:error, _reason} ->
+        empty_partition_info(partition)
+    end
+  rescue
+    _ -> empty_partition_info(partition)
+  end
+
+  defp empty_partition_info(partition) do
+    %{
+      partition: partition,
+      earliest_offset: 0,
+      latest_offset: -1,
+      size_bytes: 0
+    }
   end
 end
 

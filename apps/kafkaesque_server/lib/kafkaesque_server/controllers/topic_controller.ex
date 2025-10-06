@@ -74,4 +74,35 @@ defmodule KafkaesqueServer.TopicController do
 
     json(conn, %{topics: topic_list})
   end
+
+  def show(conn, %{"topic" => topic}) do
+    Logger.info("REST: Describing topic #{topic}")
+
+    case TopicSupervisor.describe_topic(topic) do
+      {:ok, info} ->
+        response = %{
+          topic: info.name,
+          partitions: info.partitions,
+          retention_hours: info.retention_hours || 0,
+          created_at_ms: info.created_at_ms || 0,
+          partition_infos: Enum.map(info.partition_infos, &format_partition_info/1)
+        }
+
+        json(conn, response)
+
+      {:error, :topic_not_found} ->
+        conn
+        |> put_status(:not_found)
+        |> json(%{error: "Topic #{topic} does not exist"})
+    end
+  end
+
+  defp format_partition_info(%{partition: partition} = info) do
+    %{
+      partition: partition,
+      earliest_offset: Map.get(info, :earliest_offset, 0),
+      latest_offset: Map.get(info, :latest_offset, -1),
+      size_bytes: Map.get(info, :size_bytes, 0)
+    }
+  end
 end

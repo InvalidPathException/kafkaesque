@@ -110,6 +110,14 @@ defmodule Kafkaesque.CommitOffsetsResponse do
   use Protobuf, protoc_gen_elixir_version: "0.15.0", syntax: :proto3
 end
 
+defmodule Kafkaesque.DescribeTopicRequest do
+  @moduledoc false
+
+  use Protobuf, protoc_gen_elixir_version: "0.15.0", syntax: :proto3
+
+  field(:topic, 1, type: :string)
+end
+
 defmodule Kafkaesque.GetOffsetsRequest do
   @moduledoc false
 
@@ -126,6 +134,29 @@ defmodule Kafkaesque.GetOffsetsResponse do
 
   field(:earliest, 1, type: :int64)
   field(:latest, 2, type: :int64)
+end
+
+defmodule Kafkaesque.PartitionInfo do
+  @moduledoc false
+
+  use Protobuf, protoc_gen_elixir_version: "0.15.0", syntax: :proto3
+
+  field(:partition, 1, type: :int32)
+  field(:earliest_offset, 2, type: :int64, json_name: "earliestOffset")
+  field(:latest_offset, 3, type: :int64, json_name: "latestOffset")
+  field(:size_bytes, 4, type: :int64, json_name: "sizeBytes")
+end
+
+defmodule Kafkaesque.DescribeTopicResponse do
+  @moduledoc false
+
+  use Protobuf, protoc_gen_elixir_version: "0.15.0", syntax: :proto3
+
+  field(:topic, 1, type: :string)
+  field(:partitions, 2, type: :int32)
+  field(:retention_hours, 3, type: :int64, json_name: "retentionHours")
+  field(:created_at_ms, 4, type: :int64, json_name: "createdAtMs")
+  field(:partition_infos, 5, repeated: true, type: Kafkaesque.PartitionInfo, json_name: "partitionInfos")
 end
 
 defmodule Kafkaesque.CreateTopicRequest do
@@ -171,6 +202,8 @@ defmodule Kafkaesque.Kafkaesque.Service do
   rpc(:CommitOffsets, Kafkaesque.CommitOffsetsRequest, Kafkaesque.CommitOffsetsResponse)
 
   rpc(:GetOffsets, Kafkaesque.GetOffsetsRequest, Kafkaesque.GetOffsetsResponse)
+
+  rpc(:DescribeTopic, Kafkaesque.DescribeTopicRequest, Kafkaesque.DescribeTopicResponse)
 end
 
 defmodule Kafkaesque.Kafkaesque.Stub do

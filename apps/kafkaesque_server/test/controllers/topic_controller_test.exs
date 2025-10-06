@@ -187,4 +187,34 @@ defmodule KafkaesqueServer.TopicControllerTest do
       assert topic["partitions"] == 2
     end
   end
+
+  describe "show/2" do
+    test "returns topic description when topic exists" do
+      topic_name = "describe-topic-#{:rand.uniform(999_999)}"
+      {:ok, _topic, _info} = Helpers.create_test_topic(name: topic_name, partitions: 2)
+
+      conn = conn(:get, "/v1/topics/#{topic_name}")
+      conn = TopicController.show(conn, %{"topic" => topic_name})
+
+      assert conn.status == 200
+      response = Jason.decode!(conn.resp_body)
+      assert response["topic"] == topic_name
+      assert response["partitions"] == 2
+      assert is_integer(response["created_at_ms"])
+      assert response["created_at_ms"] > 0
+      assert response["retention_hours"] >= 0
+
+      partitions = Enum.map(response["partition_infos"], & &1["partition"])
+      assert partitions == [0, 1]
+    end
+
+    test "returns 404 when topic does not exist" do
+      conn = conn(:get, "/v1/topics/non-existent")
+      conn = TopicController.show(conn, %{"topic" => "non-existent"})
+
+      assert conn.status == 404
+      response = Jason.decode!(conn.resp_body)
+      assert response["error"] =~ "Topic non-existent does not exist"
+    end
+  end
 end
